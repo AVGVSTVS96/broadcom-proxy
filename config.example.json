@@ -1,13 +1,13 @@
 {
   "listen": "127.0.0.1:8317",
   "accountOwner": true,
-  "clientKeysFile": "~/.config/broadcom-proxy/secrets/client-keys",
-  "managementKeyFile": "~/.config/broadcom-proxy/secrets/management-key",
-  "credentialsDir": "~/.config/cliproxyapi/auths",
-  "stateDir": "~/.local/state/cliproxyapi",
-  "accountsFile": "~/.config/cliproxyapi/accounts.json",
+  "clientKeysFile": "~/.config/broadcom-proxy/client-keys",
+  "managementKeyFile": "~/.config/broadcom-proxy/management-key",
+  "credentialsDir": "~/.config/broadcom-proxy/auths",
+  "stateDir": "~/.local/state/broadcom-proxy",
+  "accountsFile": "~/.local/state/broadcom-proxy/accounts.json",
   "apiKeys": [
-    { "name": "spare-credit", "keyFile": "~/.config/broadcom-proxy/secrets/api-key", "account": "you@example.com" }
+    { "name": "spare-credit", "keyFile": "~/.config/broadcom-proxy/api-key", "account": "you@example.com" }
   ],
   "policy": { "sessionCutoff": 90, "weeklyCutoff": 98, "agentsPerAccount": 100 },
   "agentSdkFactor": 1.7,

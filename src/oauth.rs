@@ -266,8 +266,8 @@ pub enum Status {
 /// What the dashboard shows to start a sign-in.
 #[derive(Serialize)]
 pub struct Started {
-    state: String,
-    url: String,
+    pub state: String,
+    pub url: String,
     /// `code`: open the url, sign in, paste the code shown. `device`: open the url and enter `user_code`.
     flow: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

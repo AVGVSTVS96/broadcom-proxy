@@ -8,19 +8,43 @@ use std::{
 use anyhow::Context;
 use broadcom_proxy::{
     app::{App, Endpoints},
-    config::Config,
-    manage, oauth, sampler,
+    config::{Config, ensure_secret},
+    manage,
+    oauth::{self, Provider, Status},
+    sampler,
 };
 
 /// How long requests in flight get to finish after SIGTERM.
 const DRAIN: Duration = Duration::from_mins(10);
 
+const USAGE: &str = "\
+usage: broadcom-proxy [config.json]        run the pool
+       broadcom-proxy login [config.json]  add a Claude account
+
+The config defaults to ~/.config/broadcom-proxy/config.json; without one, every default applies.";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let path =
-        std::env::args_os().nth(1).map_or_else(|| PathBuf::from("~/.config/broadcom-proxy/config.json"), PathBuf::from);
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    let login = args.first().is_some_and(|a| a == "login");
+    if login {
+        args.remove(0);
+    }
+    let path = args.first().map_or_else(|| PathBuf::from("~/.config/broadcom-proxy/config.json"), PathBuf::from);
     let path = broadcom_proxy::config::expand_home(&path);
     let (config, revision) = Config::load(&path)?;
+    for (file, what) in [(&config.client_keys_file, "client key"), (&config.management_key_file, "management key")] {
+        if ensure_secret(file)? {
+            println!("wrote a new {what} to {}", file.display());
+        }
+    }
+    if login {
+        return add_account(Arc::new(App::new(path, config, revision, Endpoints::default())?)).await;
+    }
     let listener = listener(&config)?;
     let app = Arc::new(App::new(path, config, revision, Endpoints::default())?);
     {
@@ -55,6 +79,20 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("stopping with requests still running after {} minutes", DRAIN.as_secs() / 60);
         }
     }
+    Ok(())
+}
+
+/// Signs a Claude account in from the terminal and saves its login with the others.
+async fn add_account(app: Arc<App>) -> anyhow::Result<()> {
+    let started = oauth::start(&app, Provider::Claude, None).await?;
+    println!("Open this link, sign in to the Claude account to add, and paste the code it shows:\n\n{}\n", started.url);
+    let mut code = String::new();
+    std::io::stdin().read_line(&mut code)?;
+    let code = code.trim().split('#').next().unwrap_or_default();
+    if let Status::Error { error } = oauth::finish_claude(&app, &started.state, code).await {
+        anyhow::bail!(error);
+    }
+    println!("Saved in {}. A running proxy picks it up within a minute.", app.config.credentials_dir.display());
     Ok(())
 }
 
