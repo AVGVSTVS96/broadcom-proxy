@@ -1,0 +1,12 @@
+[Unit]
+Description=broadcom-proxy, a Claude account pool
+Requires=broadcom-proxy.socket
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/broadcom-proxy %h/.config/broadcom-proxy/config.json
+Restart=on-failure
+TimeoutStopSec=15min
+
+[Install]
+WantedBy=default.target

@@ -86,6 +86,7 @@ async fn anthropic(State(up): State<Arc<Upstream>>, uri: Uri, headers: HeaderMap
 }
 
 struct Pool {
+    app: Arc<App>,
     proxy: String,
     up: Arc<Upstream>,
     dir: tempfile::TempDir,
@@ -137,8 +138,8 @@ async fn pool(keys: &[(&str, i64)]) -> Pool {
         openai_auth: upstream,
     };
     let app = Arc::new(App::new(at("config.json"), config, revision, ends).unwrap());
-    let proxy = serve(broadcom_proxy::router(app)).await;
-    Pool { proxy, up, dir, http: reqwest::Client::new() }
+    let proxy = serve(broadcom_proxy::router(app.clone())).await;
+    Pool { app, proxy, up, dir, http: reqwest::Client::new() }
 }
 
 fn login(dir: &Path, name: &str, token: &str) -> PathBuf {
@@ -359,4 +360,99 @@ async fn count_tokens_and_models_route_like_messages() {
     assert_eq!(models.status(), 200);
     assert_eq!(p.up.served(), ["key-hi", "key-hi"]);
     assert!(p.file("receipts.ndjson").is_empty(), "only messages leave receipts");
+}
+
+fn keys(v: &Value) -> Vec<&str> {
+    let mut k: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    k.sort_unstable();
+    k
+}
+
+/// The keys BROADCOM's `lib/proxy/schema.ts` decodes.
+#[tokio::test]
+async fn the_live_stream_and_history_keep_broadcoms_shapes() {
+    let p = pool(&[]).await;
+    p.send("claude-x", Some(SESSION)).await;
+    tokio::spawn(broadcom_proxy::manage::run_live(p.app.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let mut events =
+        p.http.get(format!("{}/v8/management/deck/events", p.proxy)).bearer_auth("admin-key").send().await.unwrap();
+    let frame = String::from_utf8(events.chunk().await.unwrap().unwrap().to_vec()).unwrap();
+    let snapshot: Value = serde_json::from_str(frame.trim().strip_prefix("data: ").unwrap()).unwrap();
+    assert_eq!(snapshot["type"], "snapshot");
+    let live = &snapshot["live"];
+    let account = &live["a:a"];
+    let mut want = vec![
+        "atLimit",
+        "cloud",
+        "fiveHour",
+        "heldResets",
+        "id",
+        "idle",
+        "label",
+        "plan",
+        "rank",
+        "reasons",
+        "resetsSpent",
+        "signInUntil",
+        "since",
+        "standing",
+        "week",
+        "working",
+    ];
+    want.sort_unstable();
+    assert_eq!(keys(account), want);
+    assert_eq!(keys(&account["week"]), ["cutoff", "elapsed", "resetsAt", "sampledAt", "used"]);
+    assert_eq!(keys(&live["pool"]), ["decision", "next", "notes", "order", "policy", "revision"]);
+    assert_eq!(keys(&live["pool"]["policy"]), ["agentsPerAccount", "sessionCutoff", "weeklyCutoff"]);
+    assert!(["next", "open", "tight", "limited", "signed-out"].contains(&account["standing"].as_str().unwrap()));
+
+    let history: Value = p
+        .http
+        .get(format!("{}/v8/management/deck/accounts", p.proxy))
+        .bearer_auth("admin-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(keys(&history), ["history", "hosts", "moves"]);
+    assert_eq!(keys(&history["moves"][0]), ["at", "cause", "from", "label", "session", "to"]);
+    assert_eq!(history["moves"][0]["cause"], "start");
+    assert_eq!(keys(&history["hosts"][0]), ["host", "seats", "seenAt"]);
+
+    let unauthorized = p.http.get(format!("{}/v8/management/deck/accounts", p.proxy)).send().await.unwrap();
+    assert_eq!(unauthorized.status(), 401);
+}
+
+#[tokio::test]
+async fn a_policy_saves_only_at_the_revision_it_was_read_at() {
+    let p = pool(&[]).await;
+    let post = |body: Value| {
+        p.http
+            .post(format!("{}/v8/management/deck/accounts/policy", p.proxy))
+            .bearer_auth("admin-key")
+            .json(&body)
+            .send()
+    };
+    let policy = json!({"sessionCutoff": 80, "weeklyCutoff": 95, "agentsPerAccount": 50});
+    let preview: Value = post(json!({"policy": policy, "save": false})).await.unwrap().json().await.unwrap();
+    assert_eq!(preview["pool"]["policy"]["sessionCutoff"], 80.0);
+    let revision = p.app.state().revision.clone();
+    let stale: Value =
+        post(json!({"policy": policy, "save": true, "revision": "\"old\""})).await.unwrap().json().await.unwrap();
+    assert_eq!((stale["saved"].as_bool(), stale["conflict"].as_bool()), (Some(false), Some(true)));
+    let saved: Value =
+        post(json!({"policy": policy, "save": true, "revision": revision})).await.unwrap().json().await.unwrap();
+    assert_eq!(saved["saved"], true);
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(p.dir.path().join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["policy"]["weeklyCutoff"], 95.0);
+    assert_ne!(saved["pool"]["revision"], json!(revision));
+    let bad = post(json!({"policy": {"sessionCutoff": 0, "weeklyCutoff": 95, "agentsPerAccount": 50}, "save": false}))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
 }
