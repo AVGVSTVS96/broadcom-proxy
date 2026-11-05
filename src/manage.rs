@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,12 +30,13 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/deck/events", get(events))
         .route("/deck/accounts", get(accounts))
         .route("/deck/accounts/policy", post(policy))
-        .route("/credentials", get(credentials).delete(delete_credential))
+        .route("/credentials", get(credentials).delete(delete_credentials))
         .route("/credentials/status", patch(credential_status))
         .route("/credentials/refresh", post(refresh_credential))
-        .route("/oauth/start", post(sign_in_start))
+        .route("/oauth/auth-url", get(sign_in_start))
         .route("/oauth/status", get(sign_in_status))
-        .route("/oauth/finish", post(sign_in_finish))
+        .route("/oauth/callback", post(sign_in_callback))
+        .route("/oauth/session", delete(sign_in_cancel))
         .route("/pool/resets/{account}/spend", post(spend_reset))
         .layer(middleware::from_fn_with_state(app, authorize))
 }
@@ -57,14 +58,22 @@ fn no_store(value: Value) -> Response {
     ([("cache-control", "no-store")], Json(value)).into_response()
 }
 
-/// Keeps the live stream current: after anything changes, and every 30 seconds for the
-/// counts that age, with a heartbeat every 20.
+fn done() -> Response {
+    no_store(json!({}))
+}
+
+fn owner_only(app: &App) -> Option<Response> {
+    (!app.config.account_owner)
+        .then(|| fail(StatusCode::CONFLICT, "This proxy doesn't own the accounts, so it leaves their logins alone."))
+}
+
+/// Keeps the live stream current after anything changes, with a heartbeat every 20 seconds.
+/// The sampler's minute ticks count as changes, so counts that age stay current.
 pub async fn run_live(app: Arc<App>) {
     let mut beat = tokio::time::interval(Duration::from_secs(20));
     loop {
         tokio::select! {
             () = app.changed.notified() => tokio::time::sleep(Duration::from_millis(250)).await,
-            () = tokio::time::sleep(Duration::from_secs(30)) => {}
             _ = beat.tick() => {
                 app.live.heartbeat();
                 continue;
@@ -322,100 +331,109 @@ async fn policy(State(app): State<Arc<App>>, Json(body): Json<PolicyRequest>) ->
     }
 }
 
+/// Every OAuth login, as BROADCOM's Accounts page lists them.
 async fn credentials(State(app): State<Arc<App>>) -> Response {
     let now = files::now_ms();
     let state = app.state();
     let logins = state
         .accounts
         .iter()
-        .map(|a| (&a.login, a.needs_reauth, a.cool_until))
-        .chain(state.others.iter().map(|l| (l, false, 0)));
-    let mut list: Vec<Value> = logins
-        .map(|(l, needs_reauth, cool_until)| {
-            json!({"id": l.name(), "provider": l.kind(), "email": l.get("email"), "account": l.get("account_uuid"),
-                   "disabled": l.disabled(), "needsReauth": needs_reauth, "expiresAt": l.expires_at(),
-                   "signInUntil": l.sign_in_until(), "coolingUntil": (cool_until > now).then_some(cool_until)})
+        .map(|a| (&a.login, a.id(), a.needs_reauth, a.cool_until))
+        .chain(state.others.iter().map(|l| (l, l.name(), false, 0)));
+    let list: Vec<Value> = logins
+        .map(|(l, index, needs_reauth, cool_until)| {
+            let mut file = json!({"auth_index": index, "name": l.name(), "provider": l.kind(), "disabled": l.disabled(),
+                                  "status": if l.disabled() { "disabled" } else if needs_reauth { "error" } else { "active" }});
+            if !l.get("email").is_empty() {
+                file["email"] = l.get("email").into();
+            }
+            if needs_reauth {
+                file["requires_sign_in"] = true.into();
+                file["status_message"] = "Signed out: sign in again.".into();
+            } else if cool_until > now {
+                file["unavailable"] = true.into();
+                file["status_message"] = format!("Cooling down until {}.", files::when(cool_until)).into();
+            }
+            file
         })
         .collect();
-    list.extend(state.keys.iter().map(|k| {
-        json!({"id": k.id, "provider": "claude-api-key", "name": k.name, "prefix": k.prefix, "priority": k.priority,
-               "coolingUntil": (k.cool_until > now).then_some(k.cool_until)})
-    }));
-    no_store(json!({"credentials": list}))
+    no_store(json!({"files": list}))
 }
 
 #[derive(Deserialize)]
-struct CredentialId {
-    id: String,
+struct Named {
+    name: String,
 }
 
 #[derive(Deserialize)]
 struct StatusRequest {
-    id: String,
+    name: String,
     disabled: bool,
 }
 
-/// Runs `change` on the login named `id` and saves it.
-fn change_login(app: &App, id: &str, change: impl FnOnce(&mut crate::accounts::Login)) -> Response {
-    if !app.config.account_owner {
-        return fail(StatusCode::CONFLICT, "This proxy doesn't own the accounts, so it leaves their files alone.");
-    }
-    let saved = {
-        let mut guard = app.state();
-        let state = &mut *guard;
-        let login =
-            state.accounts.iter_mut().map(|a| &mut a.login).chain(state.others.iter_mut()).find(|l| l.name() == id);
-        let Some(login) = login else { return fail(StatusCode::NOT_FOUND, "No such credential.") };
-        change(login);
-        login.save()
-    };
-    app.changed.notify_one();
-    match saved {
-        Ok(()) => no_store(json!({"ok": true})),
-        Err(err) => fail(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-    }
-}
-
 async fn credential_status(State(app): State<Arc<App>>, Json(body): Json<StatusRequest>) -> Response {
-    change_login(&app, &body.id, |l| l.set("disabled", body.disabled))
+    if let Some(refused) = owner_only(&app) {
+        return refused;
+    }
+    let path = app.config.credentials_dir.join(&body.name);
+    let fields = [("disabled".to_string(), Value::from(body.disabled))].into_iter().collect();
+    match app.update_login(&path, fields) {
+        Some(_) => done(),
+        None => fail(StatusCode::NOT_FOUND, "No such credential."),
+    }
 }
 
-async fn delete_credential(State(app): State<Arc<App>>, Query(q): Query<CredentialId>) -> Response {
-    if !app.config.account_owner {
-        return fail(StatusCode::CONFLICT, "This proxy doesn't own the accounts, so it leaves their files alone.");
-    }
-    let path = app.config.credentials_dir.join(&q.id);
-    if q.id.contains('/') || !path.is_file() {
-        return fail(StatusCode::NOT_FOUND, "No such credential.");
-    }
-    if let Err(err) = std::fs::remove_file(&path) {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
-    }
-    app.rescan();
-    no_store(json!({"ok": true}))
+#[derive(Deserialize)]
+struct Names {
+    names: Vec<String>,
 }
 
-async fn refresh_credential(State(app): State<Arc<App>>, Json(body): Json<CredentialId>) -> Response {
-    if !app.config.account_owner {
-        return fail(StatusCode::CONFLICT, "Only the proxy that owns the accounts refreshes their tokens.");
+/// Removes logins from the pool and their files, together, so nothing writes one back.
+async fn delete_credentials(State(app): State<Arc<App>>, Json(body): Json<Names>) -> Response {
+    if let Some(refused) = owner_only(&app) {
+        return refused;
     }
-    let path = app.config.credentials_dir.join(&body.id);
+    let mut state = app.state();
+    for name in &body.names {
+        let path = app.config.credentials_dir.join(name);
+        let known = state.accounts.iter().map(|a| &a.login).chain(state.others.iter()).any(|l| l.path == path);
+        if !known {
+            return fail(StatusCode::NOT_FOUND, &format!("No credential named {name}."));
+        }
+        if let Err(err) = std::fs::remove_file(&path) {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+        }
+        state.accounts.retain(|a| a.login.path != path);
+        state.others.retain(|l| l.path != path);
+    }
+    drop(state);
+    app.changed.notify_one();
+    done()
+}
+
+async fn refresh_credential(State(app): State<Arc<App>>, Json(body): Json<Named>) -> Response {
+    if let Some(refused) = owner_only(&app) {
+        return refused;
+    }
+    let path = app.config.credentials_dir.join(&body.name);
     match oauth::refresh_if(&app, &path, |_| true).await {
-        Ok(login) => no_store(json!({"ok": true, "expiresAt": login.expires_at()})),
+        Ok(_) => done(),
         Err(err) => fail(StatusCode::BAD_GATEWAY, &err.to_string()),
     }
 }
 
 #[derive(Deserialize)]
-struct StartRequest {
+struct StartQuery {
     provider: Provider,
+    name: Option<String>,
 }
 
-async fn sign_in_start(State(app): State<Arc<App>>, Json(body): Json<StartRequest>) -> Response {
-    if !app.config.account_owner {
-        return fail(StatusCode::CONFLICT, "Sign in on the proxy that owns the accounts.");
+/// Starts a sign-in that finishes on any device: Claude's code page, or ChatGPT's device code.
+async fn sign_in_start(State(app): State<Arc<App>>, Query(q): Query<StartQuery>) -> Response {
+    if let Some(refused) = owner_only(&app) {
+        return refused;
     }
-    match oauth::start(&app, body.provider).await {
+    match oauth::start(&app, q.provider, q.name.filter(|n| !n.is_empty())).await {
         Ok(started) => no_store(serde_json::to_value(started).unwrap_or_default()),
         Err(err) => fail(StatusCode::BAD_GATEWAY, &err.to_string()),
     }
@@ -431,29 +449,47 @@ async fn sign_in_status(State(app): State<Arc<App>>, Query(q): Query<StateQuery>
 }
 
 #[derive(Deserialize)]
-struct FinishRequest {
-    state: String,
+struct Callback {
+    provider: Provider,
+    #[serde(default)]
     code: String,
+    #[serde(default)]
+    state: String,
+    redirect_url: Option<String>,
 }
 
-async fn sign_in_finish(State(app): State<Arc<App>>, Json(body): Json<FinishRequest>) -> Response {
-    no_store(serde_json::to_value(oauth::finish_claude(&app, &body.state, &body.code).await).unwrap_or_default())
+/// The code from Claude's page, or the address it redirected to.
+async fn sign_in_callback(State(app): State<Arc<App>>, Json(body): Json<Callback>) -> Response {
+    if body.provider != Provider::Claude {
+        return fail(StatusCode::BAD_REQUEST, "ChatGPT signs in with its device code; there's nothing to paste.");
+    }
+    let (mut code, mut state) = (body.code, body.state);
+    if let Some(url) = body.redirect_url.as_deref().and_then(|u| reqwest::Url::parse(u).ok()) {
+        for (key, value) in url.query_pairs() {
+            match &*key {
+                "code" => code = value.into_owned(),
+                "state" => state = value.into_owned(),
+                _ => {}
+            }
+        }
+    }
+    match oauth::finish_claude(&app, &state, &code).await {
+        oauth::Status::Error { error } => fail(StatusCode::BAD_REQUEST, &error),
+        _ => done(),
+    }
+}
+
+async fn sign_in_cancel(State(app): State<Arc<App>>, Query(q): Query<StateQuery>) -> Response {
+    app.sign_ins.cancel(&q.state);
+    done()
 }
 
 /// Spends the account's held weekly reset that expires first, now.
 async fn spend_reset(State(app): State<Arc<App>>, Path(account): Path<String>) -> Response {
-    if !app.config.account_owner {
-        return fail(StatusCode::CONFLICT, "Only the proxy that owns the accounts spends their resets.");
+    if let Some(refused) = owner_only(&app) {
+        return refused;
     }
-    let now = files::now_ms();
-    let grant = {
-        let state = app.state();
-        let held = state.accounts.iter().find(|a| a.id() == account).map(|a| a.resets.clone()).unwrap_or_default();
-        held.into_iter().filter(|g| g.live(now)).min_by_key(|g| g.expires_at.unwrap_or(i64::MAX))
-    };
-    let Some(grant) = grant else { return fail(StatusCode::NOT_FOUND, "That account holds no weekly reset.") };
-    let plan = pool::ResetPlan { index: 0, grant, why: None, plan: String::new() };
-    let spent = sampler::spend(&app, &account, plan, "asked for from the dashboard", now).await;
+    let spent = sampler::spend(&app, &account, true, files::now_ms()).await;
     no_store(json!({"spent": spent}))
 }
 

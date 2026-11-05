@@ -75,8 +75,14 @@ pub async fn refresh_due(app: &App) {
     let due = |l: &Login| !l.disabled() && l.expires_at().is_none_or(|at| at - files::now_ms() <= REFRESH_AHEAD);
     let paths: Vec<PathBuf> = {
         let state = app.state();
-        let claude = state.accounts.iter().filter(|a| !a.needs_reauth).map(|a| &a.login);
-        claude.chain(state.others.iter()).filter(|l| due(l)).map(|l| l.path.clone()).collect()
+        state
+            .accounts
+            .iter()
+            .map(|a| &a.login)
+            .chain(state.others.iter())
+            .filter(|l| due(l))
+            .map(|l| l.path.clone())
+            .collect()
     };
     for path in paths {
         if let Err(err) = refresh_if(app, &path, due).await {
@@ -93,14 +99,13 @@ pub async fn refresh_if(app: &App, path: &Path, needed: impl FnOnce(&Login) -> b
         let state = app.state();
         state.accounts.iter().map(|a| &a.login).chain(state.others.iter()).find(|l| l.path == path).cloned()
     };
-    let Some(mut login) = login else { return Err(RefreshError::Failed("the login is gone".into())) };
+    let Some(login) = login else { return Err(RefreshError::Failed("the login is gone".into())) };
     if !needed(&login) {
         return Ok(login);
     }
-    match refresh(app, &mut login).await {
-        Ok(()) => {
-            store(app, login.clone());
-            Ok(login)
+    match refresh(app, &login).await {
+        Ok(fields) => {
+            app.update_login(path, fields).ok_or_else(|| RefreshError::Failed("the login was removed".into()))
         }
         Err(err) => {
             if let RefreshError::SignedOut(_) = err {
@@ -109,30 +114,6 @@ pub async fn refresh_if(app: &App, path: &Path, needed: impl FnOnce(&Login) -> b
             Err(err)
         }
     }
-}
-
-/// Puts a refreshed or new login in its place, on disk and in the pool.
-fn store(app: &App, mut login: Login) {
-    if let Err(err) = login.save() {
-        eprintln!("save {}: {err}", login.path.display());
-        return;
-    }
-    let mut state = app.state();
-    if login.kind() == "claude" {
-        match state.accounts.iter_mut().find(|a| a.login.path == login.path) {
-            Some(a) => {
-                a.login = login;
-                a.needs_reauth = false;
-                a.cool_until = 0;
-            }
-            None => state.accounts.push(Account::new(login)),
-        }
-    } else {
-        state.others.retain(|l| l.path != login.path);
-        state.others.push(login);
-    }
-    drop(state);
-    app.changed.notify_one();
 }
 
 fn mark_signed_out(app: &App, login: &Login) {
@@ -144,8 +125,8 @@ fn mark_signed_out(app: &App, login: &Login) {
     app.changed.notify_one();
 }
 
-/// Trades the login's refresh token for a new access token and writes the result into it.
-async fn refresh(app: &App, login: &mut Login) -> Result<(), RefreshError> {
+/// Trades the login's refresh token for a new access token: the fields to write.
+async fn refresh(app: &App, login: &Login) -> Result<Fields, RefreshError> {
     let now = files::now_ms();
     let refresh_token = login.get("refresh_token").to_string();
     if refresh_token.is_empty() {
@@ -174,11 +155,11 @@ async fn refresh(app: &App, login: &mut Login) -> Result<(), RefreshError> {
         });
     }
     let tokens: Tokens = serde_json::from_value(body).map_err(|e| RefreshError::Failed(e.to_string()))?;
-    tokens.apply(login, now);
+    let mut fields = tokens.fields(now);
     if login.kind() == "claude" {
-        fill_profile(app, login).await;
+        fill_profile(app, &mut fields).await;
     }
-    Ok(())
+    Ok(fields)
 }
 
 fn claude_token_request(app: &App) -> reqwest::RequestBuilder {
@@ -198,20 +179,23 @@ struct Tokens {
     organization: Option<Value>,
 }
 
+type Fields = serde_json::Map<String, Value>;
+
 impl Tokens {
-    fn apply(self, login: &mut Login, now: i64) {
-        login.set("access_token", self.access_token);
+    fn fields(self, now: i64) -> Fields {
+        let mut out = Fields::new();
+        out.insert("access_token".into(), self.access_token.into());
         if let Some(t) = self.refresh_token.filter(|t| !t.is_empty()) {
-            login.set("refresh_token", t);
+            out.insert("refresh_token".into(), t.into());
         }
         if let Some(t) = self.id_token.filter(|t| !t.is_empty()) {
-            login.set("id_token", t);
+            out.insert("id_token".into(), t.into());
         }
         if let Some(s) = self.expires_in {
-            login.set("expired", files::local(now + s * SECOND));
+            out.insert("expired".into(), files::local(now + s * SECOND).into());
         }
         if let Some(s) = self.refresh_token_expires_in.filter(|&s| s > 0) {
-            login.set("refresh_expired", files::local(now + s * SECOND));
+            out.insert("refresh_expired".into(), files::local(now + s * SECOND).into());
         }
         let text = |v: &Option<Value>, key: &str| {
             v.as_ref().and_then(|v| v.get(key)).and_then(Value::as_str).map(String::from)
@@ -223,16 +207,17 @@ impl Tokens {
             ("organization_name", text(&self.organization, "name")),
         ] {
             if let Some(v) = value.filter(|v| !v.is_empty()) {
-                login.set(field, v);
+                out.insert(field.into(), v.into());
             }
         }
-        login.set("last_refresh", files::local(now));
+        out.insert("last_refresh".into(), files::local(now).into());
+        out
     }
 }
 
-/// Fills a Claude login's account, email and organization from its profile.
-async fn fill_profile(app: &App, login: &mut Login) {
-    let token = login.get("access_token").to_string();
+/// Fills in a Claude login's account, email and organization from its profile.
+async fn fill_profile(app: &App, fields: &mut Fields) {
+    let token = fields.get("access_token").and_then(Value::as_str).unwrap_or("").to_string();
     let Ok(response) = crate::sampler::anthropic_get(app, &token, "/api/oauth/profile").await else { return };
     let Ok(profile) = response.json::<Value>().await else { return };
     let text = |p: &str| profile.pointer(p).and_then(Value::as_str).filter(|v| !v.is_empty()).map(String::from);
@@ -243,7 +228,7 @@ async fn fill_profile(app: &App, login: &mut Login) {
         ("organization_name", "/organization/name"),
     ] {
         if let Some(v) = text(pointer) {
-            login.set(field, v);
+            fields.insert(field.into(), v.into());
         }
     }
 }
@@ -256,6 +241,8 @@ pub struct SignIns(Mutex<HashMap<String, SignIn>>);
 struct SignIn {
     provider: Provider,
     verifier: String,
+    /// The login to sign in again, by file name, if the dashboard named one.
+    target: Option<String>,
     started: i64,
     status: Status,
 }
@@ -268,17 +255,16 @@ pub enum Provider {
 }
 
 /// Where a sign-in stands.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum Status {
-    Pending,
-    Ok { credential: String, email: String },
+    Wait,
+    Ok,
     Error { error: String },
 }
 
 /// What the dashboard shows to start a sign-in.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Started {
     state: String,
     url: String,
@@ -309,6 +295,10 @@ impl SignIns {
     pub fn status(&self, state: &str) -> Status {
         self.get(state).map_or(Status::Error { error: "unknown or expired sign-in".into() }, |s| s.status)
     }
+
+    pub fn cancel(&self, state: &str) {
+        self.0.lock().expect("sign-ins lock").remove(state);
+    }
 }
 
 fn random(bytes: usize) -> String {
@@ -317,7 +307,7 @@ fn random(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(buf)
 }
 
-pub async fn start(app: &std::sync::Arc<App>, provider: Provider) -> anyhow::Result<Started> {
+pub async fn start(app: &std::sync::Arc<App>, provider: Provider, target: Option<String>) -> anyhow::Result<Started> {
     let state = random(24);
     let now = files::now_ms();
     match provider {
@@ -337,7 +327,7 @@ pub async fn start(app: &std::sync::Arc<App>, provider: Provider) -> anyhow::Res
                     ("state", &state),
                 ],
             )?;
-            app.sign_ins.put(&state, SignIn { provider, verifier, started: now, status: Status::Pending });
+            app.sign_ins.put(&state, SignIn { provider, verifier, target, started: now, status: Status::Wait });
             Ok(Started { state, url: url.into(), flow: "code", user_code: None })
         }
         Provider::Codex => {
@@ -361,8 +351,8 @@ pub async fn start(app: &std::sync::Arc<App>, provider: Provider) -> anyhow::Res
                 .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
                 .unwrap_or(5)
                 .max(1);
-            app.sign_ins
-                .put(&state, SignIn { provider, verifier: String::new(), started: now, status: Status::Pending });
+            let sign_in = SignIn { provider, verifier: String::new(), target, started: now, status: Status::Wait };
+            app.sign_ins.put(&state, sign_in);
             tokio::spawn(wait_for_device(app.clone(), state.clone(), device, code.clone(), every));
             Ok(Started { state, url: CODEX_DEVICE_PAGE.into(), flow: "device", user_code: Some(code) })
         }
@@ -370,17 +360,17 @@ pub async fn start(app: &std::sync::Arc<App>, provider: Provider) -> anyhow::Res
 }
 
 /// Trades the code Claude's page showed for tokens and adds the account to the pool.
-pub async fn finish_claude(app: &App, state: &str, pasted: &str) -> Status {
+pub async fn finish_claude(app: &App, state: &str, code: &str) -> Status {
     let Some(sign_in) = app.sign_ins.get(state).filter(|s| s.provider == Provider::Claude) else {
         return Status::Error { error: "unknown or expired sign-in".into() };
     };
-    let (code, pasted_state) = pasted.trim().split_once('#').unwrap_or((pasted.trim(), state));
     let body = json!({
-        "grant_type": "authorization_code", "code": code, "redirect_uri": CLAUDE_PASTE_PAGE,
-        "client_id": CLAUDE_CLIENT_ID, "code_verifier": sign_in.verifier, "state": pasted_state,
+        "grant_type": "authorization_code", "code": code.trim(), "redirect_uri": CLAUDE_PASTE_PAGE,
+        "client_id": CLAUDE_CLIENT_ID, "code_verifier": sign_in.verifier, "state": state,
     });
-    let status = match exchange(app, claude_token_request(app).json(&body), "claude").await {
-        Ok(status) => status,
+    let request = claude_token_request(app).json(&body);
+    let status = match exchange(app, request, "claude", sign_in.target.as_deref()).await {
+        Ok(()) => Status::Ok,
         Err(err) => Status::Error { error: err.to_string() },
     };
     app.sign_ins.finish(state, status.clone());
@@ -391,6 +381,7 @@ async fn wait_for_device(app: std::sync::Arc<App>, state: String, device: String
     let deadline = files::now_ms() + SIGN_IN_FOR;
     let status = loop {
         tokio::time::sleep(Duration::from_secs(every as u64)).await;
+        let Some(sign_in) = app.sign_ins.get(&state) else { return };
         if files::now_ms() > deadline {
             break Status::Error { error: "The device code expired before it was entered.".into() };
         }
@@ -416,13 +407,17 @@ async fn wait_for_device(app: std::sync::Arc<App>, state: String, device: String
             ("redirect_uri", CODEX_DEVICE_CALLBACK),
             ("code_verifier", text("code_verifier")),
         ]);
-        break exchange(&app, request, "codex").await.unwrap_or_else(|err| Status::Error { error: err.to_string() });
+        break match exchange(&app, request, "codex", sign_in.target.as_deref()).await {
+            Ok(()) => Status::Ok,
+            Err(err) => Status::Error { error: err.to_string() },
+        };
     };
     app.sign_ins.finish(&state, status);
 }
 
-/// Sends a code exchange, writes the login it returns and adds it to the pool.
-async fn exchange(app: &App, request: reqwest::RequestBuilder, kind: &str) -> anyhow::Result<Status> {
+/// Sends a code exchange and adds the login it returns to the pool: onto the login for the
+/// same account, or the one the dashboard named, or as a new file.
+async fn exchange(app: &App, request: reqwest::RequestBuilder, kind: &str, target: Option<&str>) -> anyhow::Result<()> {
     let now = files::now_ms();
     let response = request.timeout(Duration::from_secs(30)).send().await?;
     let status = response.status();
@@ -433,43 +428,50 @@ async fn exchange(app: &App, request: reqwest::RequestBuilder, kind: &str) -> an
         body.pointer("/error").map(Value::to_string).unwrap_or_default()
     );
     let tokens: Tokens = serde_json::from_value(body)?;
-    let mut login = Login { path: PathBuf::new(), fields: serde_json::Map::new(), modified: None };
+    let mut login = Login { path: PathBuf::new(), fields: tokens.fields(now), modified: None };
     login.set("type", kind);
-    tokens.apply(&mut login, now);
     let name = if kind == "claude" {
-        fill_profile(app, &mut login).await;
+        fill_profile(app, &mut login.fields).await;
         claude_file_name(&login)
     } else {
         codex_fields(&mut login);
         codex_file_name(&login)
     };
     anyhow::ensure!(!login.get("email").is_empty(), "The sign-in returned no email.");
-    let existing = {
-        let state = app.state();
-        let account = login.get("account_uuid");
-        state
-            .accounts
-            .iter()
-            .map(|a| &a.login)
-            .chain(state.others.iter())
-            .find(|l| l.kind() == kind && !account.is_empty() && l.get("account_uuid") == account || l.name() == name)
-            .cloned()
+    let account = login.get("account_uuid").to_string();
+    let same = |l: &Login| {
+        l.kind() == kind
+            && ((!account.is_empty() && l.get("account_uuid") == account)
+                || target.is_some_and(|t| l.name() == t)
+                || l.name() == name)
     };
-    login.path = app.config.credentials_dir.join(&name);
-    if let Some(old) = existing {
-        let mut fields = old.fields;
-        fields.extend(login.fields);
-        login = Login { path: old.path, fields, modified: old.modified };
-    } else if kind == "claude" {
-        let mut device = [0u8; 32];
-        rand::rng().fill_bytes(&mut device);
-        login.set("claude_device_ids", json!([hex(&device)]));
-        login.set("disabled", false);
+    let mut guard = app.state();
+    let state = &mut *guard;
+    let existing =
+        state.accounts.iter().map(|a| &a.login).chain(state.others.iter()).find(|l| same(l)).map(|l| l.path.clone());
+    if let Some(path) = existing {
+        state.update_login(&path, login.fields);
+        if let Some(a) = state.accounts.iter_mut().find(|a| a.login.path == path) {
+            a.cool_until = 0;
+        }
+    } else {
+        login.path = app.config.credentials_dir.join(&name);
+        if kind == "claude" {
+            let mut device = [0u8; 32];
+            rand::rng().fill_bytes(&mut device);
+            login.set("claude_device_ids", json!([hex(&device)]));
+            login.set("disabled", false);
+        }
+        login.save()?;
+        if kind == "claude" {
+            state.accounts.push(Account::new(login));
+        } else {
+            state.others.push(login);
+        }
     }
-    let email = login.get("email").to_string();
-    let credential = login.name();
-    store(app, login);
-    Ok(Status::Ok { credential, email })
+    drop(guard);
+    app.changed.notify_one();
+    Ok(())
 }
 
 /// `claude-<hash of org>-<email>.json`, as CLIProxyAPI names Claude logins.
@@ -529,7 +531,7 @@ mod tests {
     fn a_refresh_keeps_the_old_refresh_token_when_none_comes_back() {
         let mut l = login(json!({"type": "claude", "access_token": "old", "refresh_token": "keep", "other": 1}));
         let tokens: Tokens = serde_json::from_value(json!({"access_token": "new", "expires_in": 28800})).unwrap();
-        tokens.apply(&mut l, 1_800_000_000_000);
+        l.fields.extend(tokens.fields(1_800_000_000_000));
         assert_eq!(l.get("access_token"), "new");
         assert_eq!(l.get("refresh_token"), "keep");
         assert_eq!(l.fields["other"], 1);

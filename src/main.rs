@@ -12,6 +12,9 @@ use broadcom_proxy::{
     manage, oauth, sampler,
 };
 
+/// How long requests in flight get to finish after SIGTERM.
+const DRAIN: Duration = Duration::from_mins(10);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let path =
@@ -37,7 +40,21 @@ async fn main() -> anyhow::Result<()> {
     }
     tokio::spawn(manage::run_live(app.clone()));
 
-    axum::serve(listener, broadcom_proxy::router(app)).with_graceful_shutdown(shutdown()).await?;
+    let stopping = Arc::new(tokio::sync::Notify::new());
+    let server = axum::serve(listener, broadcom_proxy::router(app.clone())).with_graceful_shutdown({
+        let stopping = stopping.clone();
+        async move {
+            shutdown().await;
+            app.live.close();
+            stopping.notify_one();
+        }
+    });
+    tokio::select! {
+        served = server => served?,
+        () = async { stopping.notified().await; tokio::time::sleep(DRAIN).await } => {
+            eprintln!("stopping with requests still running after {} minutes", DRAIN.as_secs() / 60);
+        }
+    }
     Ok(())
 }
 
@@ -69,7 +86,7 @@ where
     }
 }
 
-/// SIGTERM or Ctrl-C: stop taking connections and let requests in flight finish.
+/// SIGTERM or Ctrl-C.
 async fn shutdown() {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
     tokio::select! {

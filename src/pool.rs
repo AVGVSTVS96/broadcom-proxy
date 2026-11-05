@@ -158,7 +158,7 @@ impl Cause {
 }
 
 /// The next time a periodic window resets after `now`, from one known reset time.
-fn next_reset(mut at: i64, now: i64, period: i64) -> i64 {
+pub fn next_reset(mut at: i64, now: i64, period: i64) -> i64 {
     if at <= 0 {
         return 0;
     }

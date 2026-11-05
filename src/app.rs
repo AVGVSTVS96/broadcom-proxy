@@ -54,6 +54,8 @@ pub struct App {
     pub sign_ins: SignIns,
     /// One token refresh at a time, so a token is never refreshed twice.
     pub refreshing: tokio::sync::Mutex<()>,
+    /// One reset claim at a time, so the pool and the dashboard can't both spend one.
+    pub spending: tokio::sync::Mutex<()>,
 }
 
 pub struct State {
@@ -146,9 +148,11 @@ impl App {
             live: Stream::default(),
             sign_ins: SignIns::default(),
             refreshing: tokio::sync::Mutex::new(()),
+            spending: tokio::sync::Mutex::new(()),
             config,
         };
         app.rescan();
+        crate::sampler::load_claims(&app);
         Ok(app)
     }
 
@@ -160,37 +164,49 @@ impl App {
         &self.config.state_dir
     }
 
-    /// Brings the accounts in line with the credentials directory: new logins join, changed
-    /// files are reread, removed ones leave. Live state stays with its account.
+    /// Brings the accounts in line with the credentials directory: new logins join, files
+    /// written since the proxy last read or wrote them are reread, removed ones leave. Live
+    /// state stays with its account.
     pub fn rescan(&self) {
         let logins = Login::read_dir(&self.config.credentials_dir);
         let mut state = self.state();
         let mut accounts = std::mem::take(&mut state.accounts);
-        let mut others = Vec::new();
-        let mut kept = Vec::new();
+        let mut held = std::mem::take(&mut state.others);
         for login in logins {
             if login.kind() != "claude" {
-                others.push(login);
+                let newer = held.iter().position(|l| l.path == login.path).map(|i| held.swap_remove(i));
+                state.others.push(newer.filter(|l| l.modified >= login.modified).unwrap_or(login));
                 continue;
             }
-            match accounts.iter().position(|a| a.login.path == login.path) {
+            let account = match accounts.iter().position(|a| a.login.path == login.path) {
                 Some(i) => {
                     let mut account = accounts.swap_remove(i);
-                    if account.login.modified != login.modified {
+                    if login.modified > account.login.modified {
                         if account.login.get("access_token") != login.get("access_token") {
                             account.needs_reauth = false;
                         }
                         account.login = login;
                     }
-                    kept.push(account);
+                    account
                 }
-                None => kept.push(Account::new(login)),
-            }
+                None => Account::new(login),
+            };
+            state.accounts.push(account);
         }
-        state.accounts = kept;
-        state.others = others;
         drop(state);
         self.changed.notify_one();
+    }
+
+    /// Writes `fields` onto the login at `path` as it stands now, on disk and in the pool,
+    /// and returns it. A login that's been removed stays removed.
+    pub fn update_login(
+        &self,
+        path: &std::path::Path,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Login> {
+        let login = self.state().update_login(path, fields);
+        self.changed.notify_one();
+        login
     }
 
     pub fn client_allowed(&self, headers: &HeaderMap) -> bool {
@@ -200,7 +216,7 @@ impl App {
     }
 
     pub fn weight(&self, entrypoint: &str) -> f64 {
-        if matches!(entrypoint, "sdk-cli" | "sdk-ts" | "sdk-py") { self.config.agent_sdk_factor } else { 1.0 }
+        weight(entrypoint, self.config.agent_sdk_factor)
     }
 
     /// Credit first: a bare model goes to API keys with credit, highest priority first, then
@@ -319,6 +335,26 @@ impl App {
 }
 
 impl State {
+    pub fn update_login(
+        &mut self,
+        path: &std::path::Path,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Login> {
+        let new_token = fields.contains_key("access_token");
+        let login = match self.accounts.iter_mut().find(|a| a.login.path == path) {
+            Some(a) => {
+                a.needs_reauth &= !new_token;
+                &mut a.login
+            }
+            None => self.others.iter_mut().find(|l| l.path == path)?,
+        };
+        login.fields.extend(fields);
+        if let Err(err) = login.save() {
+            eprintln!("save {}: {err}", path.display());
+        }
+        Some(login.clone())
+    }
+
     pub fn account_mut(&mut self, id: &str) -> Option<&mut Account> {
         self.accounts.iter_mut().find(|a| a.id() == id)
     }
@@ -329,14 +365,11 @@ impl State {
             .iter()
             .map(|a| {
                 let id = a.id();
-                let (working, load) = self.seats.values().filter(|s| s.account == id && now - s.seen <= WORKING).fold(
-                    (0, 0.0),
-                    |(n, load), s| {
-                        let weight =
-                            if matches!(s.entrypoint.as_str(), "sdk-cli" | "sdk-ts" | "sdk-py") { factor } else { 1.0 };
-                        (n + 1, load + weight)
-                    },
-                );
+                let (working, load) = self
+                    .seats
+                    .values()
+                    .filter(|s| s.account == id && now - s.seen <= WORKING)
+                    .fold((0, 0.0), |(n, load), s| (n + 1, load + weight(&s.entrypoint, factor)));
                 View {
                     label: a.label(),
                     reading: a.settled(a.reading, now).0.live(now),
@@ -348,6 +381,12 @@ impl State {
             })
             .collect()
     }
+}
+
+/// How much a request from `entrypoint` counts against an account: Agent SDK requests burn
+/// `factor` times what Claude Code's do.
+fn weight(entrypoint: &str, factor: f64) -> f64 {
+    if matches!(entrypoint, "sdk-cli" | "sdk-ts" | "sdk-py") { factor } else { 1.0 }
 }
 
 /// The account's limits from a response's headers: utilization is a fraction, reset a unix time.

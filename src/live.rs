@@ -15,6 +15,7 @@ struct Inner {
     keys: Vec<String>,
     live: HashMap<String, String>,
     clients: Vec<mpsc::Sender<Bytes>>,
+    closed: bool,
 }
 
 fn frame(kind: &str, keys: &[String], values: &HashMap<String, String>) -> Bytes {
@@ -34,8 +35,10 @@ impl Stream {
     pub fn subscribe(&self) -> mpsc::Receiver<Bytes> {
         let (tx, rx) = mpsc::channel(64);
         let mut inner = self.inner();
-        let _ = tx.try_send(frame("snapshot", &inner.keys, &inner.live));
-        inner.clients.push(tx);
+        if !inner.closed {
+            let _ = tx.try_send(frame("snapshot", &inner.keys, &inner.live));
+            inner.clients.push(tx);
+        }
         rx
     }
 
@@ -55,6 +58,13 @@ impl Stream {
         if !changed.is_empty() {
             inner.send(&patch);
         }
+    }
+
+    /// Ends every client's stream, so shutdown isn't held open by tabs that never hang up.
+    pub fn close(&self) {
+        let mut inner = self.inner();
+        inner.closed = true;
+        inner.clients.clear();
     }
 
     pub fn heartbeat(&self) {
@@ -93,5 +103,15 @@ mod tests {
         assert_eq!(text(&rx.try_recv().unwrap()), "data: {\"type\":\"patch\",\"live\":{\"a:1\":null}}\n\n");
         stream.publish(&[("pool".into(), json!({"y": 2}))]);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn closing_ends_every_stream() {
+        let stream = Stream::default();
+        let mut rx = stream.subscribe();
+        rx.try_recv().unwrap();
+        stream.close();
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)));
+        assert!(matches!(stream.subscribe().try_recv(), Err(mpsc::error::TryRecvError::Disconnected)));
     }
 }

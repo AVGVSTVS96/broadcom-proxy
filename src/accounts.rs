@@ -179,7 +179,7 @@ pub struct AtLimit {
 }
 
 /// The account's subscription, from its profile.
-#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Plan {
     pub tier: Option<String>,

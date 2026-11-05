@@ -3,6 +3,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::Serialize;
@@ -10,10 +11,11 @@ use serde::Serialize;
 /// Writes `bytes` to a temporary file beside `path` and renames it over `path`, so a reader
 /// sees the old file or the new one, never half of one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed)));
     let mut file = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;

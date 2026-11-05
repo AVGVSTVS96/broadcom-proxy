@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    accounts::{AtLimit, Claim, Cloud, Plan, Spent},
+    accounts::{Account, AtLimit, Claim, Cloud, Plan, Spent},
     app::{App, log_reading},
     files,
     pool::{self, HOUR, MINUTE, Reading, Reset, ResetPlan, Window},
@@ -225,18 +225,19 @@ pub fn reset_plans(app: &App, now: i64) -> Vec<(String, ResetPlan)> {
 }
 
 async fn spend_due(app: &App, now: i64) {
-    load_claims(app);
     for (account, plan) in reset_plans(app, now) {
-        if let Some(why) = plan.why.clone() {
-            spend(app, &account, plan, &why, now).await;
+        if plan.why.is_some() {
+            spend(app, &account, false, now).await;
         }
     }
 }
 
-/// Claims a held reset after rereading the account's grants to make sure Anthropic still
-/// offers it, and reports whether it was spent.
-pub async fn spend(app: &App, account: &str, mut plan: ResetPlan, why: &str, now: i64) -> bool {
-    let (token, org, fresh, label) = {
+/// Claims a held reset and reports whether it was spent. Before claiming it rereads the
+/// account's grants if they're stale and plans again, so the reset is still offered and,
+/// unless the dashboard asked, the pool still needs it.
+pub async fn spend(app: &App, account: &str, asked: bool, now: i64) -> bool {
+    let _one = app.spending.lock().await;
+    let (token, org, fresh) = {
         let state = app.state();
         let Some(a) = state.accounts.iter().find(|a| a.id() == account) else { return false };
         if a.sample_after > now || a.claim.as_ref().is_some_and(|c| c.retry_at > now) {
@@ -246,7 +247,6 @@ pub async fn spend(app: &App, account: &str, mut plan: ResetPlan, why: &str, now
             a.login.get("access_token").to_string(),
             a.login.get("organization_uuid").to_string(),
             now - a.resets_read_at <= FRESH_RESETS,
-            a.label().to_string(),
         )
     };
     if token.is_empty() || org.is_empty() {
@@ -254,12 +254,16 @@ pub async fn spend(app: &App, account: &str, mut plan: ResetPlan, why: &str, now
     }
     if !fresh {
         read_usage(app, account, &token, now).await;
-        match held(app, account, &plan.grant.id, now) {
-            Some(grant) => plan.grant = grant,
-            None => return false,
+        if app.state().accounts.iter().find(|a| a.id() == account).is_none_or(|a| a.resets_read_at != now) {
+            return false;
         }
     }
-    let Some((claim, resent)) = claim(app, account, &mut plan, why, now) else { return false };
+    let plan = if asked { dashboard_plan(app, account, now) } else { pool_plan(app, account, now) };
+    let Some(mut plan) = plan else { return false };
+    let why = plan.why.clone().unwrap_or_default();
+    let label =
+        app.state().accounts.iter().find(|a| a.id() == account).map(|a| a.label().to_string()).unwrap_or_default();
+    let Some((claim, resent)) = claim(app, account, &mut plan, &why, now) else { return false };
 
     let (status, answer) = claim_reset(app, &token, &org, &claim).await;
     let text = |k: &str| answer.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -282,24 +286,10 @@ pub async fn spend(app: &App, account: &str, mut plan: ResetPlan, why: &str, now
         let mut state = app.state();
         let Some(a) = state.account_mut(account) else { return false };
         let told = a.claim.as_ref().is_some_and(|c| c.told);
-        let mut week_ends = a.reading.week.map_or(now + pool::WEEK, |w| w.resets_at);
+        let mut week_ends = None;
         if spent {
-            week_ends = files::parse_ms(&text("weekly_resets_at")).unwrap_or(week_ends);
-            a.spent = Some(Spent { week: a.reading.week.map_or(0.0, |w| w.used), week_ends, until: now + SETTLE });
-            a.reading = Reading {
-                five_hour: a.reading.five_hour,
-                week: Some(Window { used: 0.0, resets_at: week_ends }),
-                at: now,
-            };
-            for g in &mut a.resets {
-                if g.id == plan.grant.id {
-                    g.left = resets_left.unwrap_or(g.left - 1);
-                }
-            }
-            a.resets.retain(|g| g.left > 0);
-            a.resets_read_at = 0;
-            a.claim = None;
-            a.cool_until = 0;
+            let ends = files::parse_ms(&text("weekly_resets_at"));
+            week_ends = Some(zero_week(a, &plan.grant.id, resets_left, ends, now));
         } else if settled {
             a.resets_read_at = 0;
             a.claim = Some(Claim {
@@ -316,7 +306,7 @@ pub async fn spend(app: &App, account: &str, mut plan: ResetPlan, why: &str, now
         save_claims(app, &state);
         (told, week_ends)
     };
-    if spent {
+    if let Some(week_ends) = week_ends {
         tell(
             app,
             format!(
@@ -337,11 +327,42 @@ pub async fn spend(app: &App, account: &str, mut plan: ResetPlan, why: &str, now
     spent
 }
 
-/// The account's grant `id`, if it still holds it live.
-fn held(app: &App, account: &str, id: &str, now: i64) -> Option<Reset> {
+/// Records a spent reset on the account: its week back to 0% until the next weekly reset,
+/// which the usage endpoint may not show for a while. Returns when that week ends.
+fn zero_week(a: &mut Account, grant: &str, resets_left: Option<i64>, ends: Option<i64>, now: i64) -> i64 {
+    let next = a.reading.week.map(|w| pool::next_reset(w.resets_at, now, pool::WEEK)).filter(|&at| at > 0);
+    let week_ends = ends.or(next).unwrap_or(now + pool::WEEK);
+    a.spent = Some(Spent { week: a.reading.week.map_or(0.0, |w| w.used), week_ends, until: now + SETTLE });
+    a.reading =
+        Reading { five_hour: a.reading.five_hour, week: Some(Window { used: 0.0, resets_at: week_ends }), at: now };
+    for g in &mut a.resets {
+        if g.id == grant {
+            g.left = resets_left.unwrap_or(g.left - 1);
+        }
+    }
+    a.resets.retain(|g| g.left > 0);
+    a.resets_read_at = 0;
+    a.claim = None;
+    a.cool_until = 0;
+    week_ends
+}
+
+/// The held weekly reset that expires first, which the dashboard spends when asked.
+fn dashboard_plan(app: &App, account: &str, now: i64) -> Option<ResetPlan> {
     let state = app.state();
     let a = state.accounts.iter().find(|a| a.id() == account)?;
-    a.resets.iter().find(|g| g.id == id && g.live(now)).cloned()
+    let grant = a.resets.iter().filter(|g| g.live(now)).min_by_key(|g| g.expires_at.unwrap_or(i64::MAX))?;
+    Some(ResetPlan {
+        index: 0,
+        grant: grant.clone(),
+        why: Some("asked for from the dashboard".into()),
+        plan: String::new(),
+    })
+}
+
+/// The account's reset plan, if the pool needs it spent now.
+fn pool_plan(app: &App, account: &str, now: i64) -> Option<ResetPlan> {
+    reset_plans(app, now).into_iter().find(|(id, p)| id == account && p.why.is_some()).map(|(_, p)| p)
 }
 
 /// The claim to send for the plan's grant, and whether it was sent before. A claim already
@@ -414,19 +435,16 @@ fn tell(app: &App, line: String) {
     });
 }
 
-/// Reads claims a previous run sent that Anthropic hadn't settled, once.
-fn load_claims(app: &App) {
-    static LOADED: std::sync::Once = std::sync::Once::new();
-    LOADED.call_once(|| {
-        let Ok(bytes) = std::fs::read(app.state_dir().join("reset-claims.json")) else { return };
-        let Ok(claims) = serde_json::from_slice::<std::collections::HashMap<String, Claim>>(&bytes) else { return };
-        let mut state = app.state();
-        for (account, claim) in claims {
-            if let Some(a) = state.account_mut(&account) {
-                a.claim = Some(claim);
-            }
+/// Takes up the claims a previous run sent that Anthropic hadn't settled.
+pub fn load_claims(app: &App) {
+    let Ok(bytes) = std::fs::read(app.state_dir().join("reset-claims.json")) else { return };
+    let Ok(claims) = serde_json::from_slice::<std::collections::HashMap<String, Claim>>(&bytes) else { return };
+    let mut state = app.state();
+    for (account, claim) in claims {
+        if let Some(a) = state.account_mut(&account) {
+            a.claim = Some(claim);
         }
-    });
+    }
 }
 
 fn save_claims(app: &App, state: &crate::app::State) {
@@ -490,5 +508,17 @@ mod tests {
         assert!(!grant(&json!({"id": "g", "resets_left": 1, "use_requires_limit": false})).unwrap().needs_limit);
         assert!(grant(&json!({"id": "g", "resets_left": 0})).is_none());
         assert_eq!(grant(&json!({"resets_left": 1, "gives_back_weekly": true})).unwrap().kind, "fable");
+    }
+
+    #[test]
+    fn a_spent_reset_runs_the_week_to_its_next_reset_even_from_a_stale_reading() {
+        let login = crate::accounts::Login { path: "a.json".into(), fields: serde_json::Map::new(), modified: None };
+        let mut a = Account::new(login);
+        let now = 1_800_000_000_000;
+        a.reading.week = Some(Window { used: 100.0, resets_at: now - pool::HOUR });
+        assert_eq!(zero_week(&mut a, "g", None, None, now), now - pool::HOUR + pool::WEEK);
+        a.reading.week = Some(Window { used: 100.0, resets_at: 0 });
+        assert_eq!(zero_week(&mut a, "g", None, None, now), now + pool::WEEK);
+        assert_eq!(zero_week(&mut a, "g", None, Some(now + 5), now), now + 5);
     }
 }

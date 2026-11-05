@@ -4,13 +4,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{files, pool::Policy};
 
 /// The proxy's one config file. Secrets live in their own files, named here.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -39,7 +39,7 @@ pub struct Config {
 }
 
 /// An API key with credit: it serves bare model names before any plan, highest priority first.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApiKeyConfig {
     pub name: String,
