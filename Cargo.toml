@@ -3,8 +3,12 @@ name = "broadcom-proxy"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "A Claude account pool: one address, many accounts, honest passthrough"
+description = "One address for all your Claude subscriptions: a Claude account pool for Claude Code"
 repository = "https://github.com/AVGVSTVS96/broadcom-proxy"
+readme = "README.md"
+keywords = ["claude", "anthropic", "claude-code", "proxy", "pool"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+include = ["src/**", "systemd/**", "config.example.json", "README.md", "DESIGN.md", "LICENSE"]
 
 [dependencies]
 anyhow = "1"

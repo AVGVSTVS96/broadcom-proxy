@@ -1,6 +1,6 @@
 # broadcom-proxy
 
-A Claude account pool. Agents send Claude API requests to one address; the proxy picks the account with the most room, forwards the request untouched apart from the credential, and records what happened. BROADCOM (the dashboard) and the usage service read what it records.
+A Claude account pool. Agents send Claude API requests to one address; the proxy picks the account with the most room, forwards the request untouched apart from the credential, and records what happened. A dashboard ([BROADCOM](https://github.com/AVGVSTVS96/broadcom)) and a usage service ([broadcom-usage](https://github.com/AVGVSTVS96/broadcom-usage)) can read what it records.
 
 ```
 agents ──/v1──▶ broadcom-proxy ──▶ api.anthropic.com
@@ -28,16 +28,16 @@ Usage collection (transcripts, other machines, GitHub artifacts, pricing, the us
 
 ## The wire: honest passthrough
 
-Every client on the pool is a real Claude Code binary (CLI, Agent SDK, or Claude Code under hex, microscope or T3 Code). The proxy forwards what the client sent and changes only what routing requires:
+The pool is built for clients that are real Claude Code (the CLI or the Agent SDK). The proxy forwards what the client sent and changes only what routing requires:
 
 - **OAuth account**: `Authorization` becomes the account's bearer token; the client's own `Authorization` and `X-Api-Key` never leave. Body bytes untouched.
 - **API key**: `x-api-key` set to the key, `Authorization` dropped, and the OAuth-only betas (`oauth-*`, `claude-code-*`) dropped. Body bytes untouched.
 - **Responses** stream back byte for byte (decompressed), with upstream headers minus hop-by-hop ones and `set-cookie`, so `anthropic-ratelimit-unified-*` and `request-id` reach the client.
-- The proxy's own calls (sampler, token refresh, reset claims, sign-in) say `User-Agent: broadcom-proxy/<version>`. Anthropic's usage and profile endpoints answer it the same as Claude Code's own client (checked in the shadow run). The token endpoint was only probed with an invalid grant, which it refused the same way for both; a real refresh, reset claim or sign-in hasn't run against Anthropic yet, only against the stand-ins in `tests/owner.rs`.
+- The proxy's own calls (sampler, token refresh, reset claims, sign-in) say `User-Agent: broadcom-proxy/<version>`. Anthropic's usage and profile endpoints answer it the same as Claude Code's own client (checked against real accounts). The token endpoint was only probed with an invalid grant, which it refused the same way for both; a real refresh, reset claim or sign-in hasn't run against Anthropic yet, only against the stand-ins in `tests/owner.rs`.
 
 It doesn't disguise clients. CLIProxyAPI rewrites non-Claude-Code clients to look like Claude Code on a Mac: it renames tools, replaces the system prompt, rewrites `metadata.user_id`, forges the billing-header signature and spoofs the TLS handshake. Our clients are Claude Code, so none of that is needed, and it's ~3k lines this proxy doesn't carry.
 
-One consequence, seen in the shadow run: Anthropic answers an OAuth request without Claude Code's system prompt with `429 rate_limit_error "Error"`, no limit headers. That's what Claude Code's own startup quota probe (`max_tokens: 1`, "quota") gets, through the proxy and direct alike, and what a plain non-Claude-Code request on a plan account gets. The proxy passes it back as the request's own.
+One consequence, seen with real accounts: Anthropic answers an OAuth request without Claude Code's system prompt with `429 rate_limit_error "Error"`, no limit headers. That's what Claude Code's own startup quota probe (`max_tokens: 1`, "quota") gets, through the proxy and direct alike, and what a plain non-Claude-Code request on a plan account gets. The proxy passes it back as the request's own.
 
 ## Routing
 
@@ -65,7 +65,7 @@ When every credential fails, the client gets the last answer; when every one is 
 
 ## Data
 
-Append-only ndjson and small JSON snapshots in the state directory, in the Go fork's names and shapes, so a rollback, the old deck and the usage service read them unchanged and nothing needs importing:
+Append-only ndjson and small JSON snapshots in the state directory, in the [Go fork](https://github.com/AVGVSTVS96/CLIProxyAPI)'s names and shapes, so a rollback to it, its dashboard and the usage service read them unchanged and nothing needs importing:
 
 | File | One line per | Read by |
 |---|---|---|
@@ -93,7 +93,7 @@ Anything that writes credentials, refreshes or spends is refused (409) unless th
 
 ## Config
 
-One camelCase JSON file (`config.example.json`): listen address, `accountOwner`, client and management key files, credentials and state directories, the account list path, API keys (name, key file, the account whose extra usage gates it), pool policy, `agentSdkFactor`, reset command. Secrets live in their own files, never inline.
+One optional camelCase JSON file (`config.example.json`), every field defaulted (README has the table): listen address, `accountOwner`, client and management key files, credentials and state directories, the account list path, API keys (name, key file, the account whose extra usage gates it), pool policy, `agentSdkFactor`, reset command. Secrets live in their own files, never inline.
 
 `accountOwner` makes this the one process that refreshes tokens, writes credential files and spends resets. Refresh tokens rotate when used, so a second refresher logs accounts out; a shadow runs with it off and rereads credential files the owner keeps current. Every write to a login (refresh, sign-in, turning it off) goes through one path under the state lock that lays only the changed fields onto the login as it stands, so a refresh can't undo a change made meanwhile or write back a removed login. A rescan takes a file only when it's newer than the copy held.
 
@@ -105,8 +105,7 @@ The credentials directory is rescanned every minute and whenever a token is refu
 - One binary, tokio + axum + reqwest on rustls. No TLS fingerprint games.
 - Logs: one line per upstream attempt to the journal (credential, model, entrypoint, the 5h/7d utilization Anthropic reported, Anthropic's error message on failure); no request dumps.
 
-## Moving off the Go proxy
+## Moving off the Go fork
 
-1. **Shadow** (done Nov 5): a spare loopback port, `accountOwner: false`, real credentials read-only. Real Claude Code requests on every account and key, each client kind.
-2. **Cut over** (on hold: the Go proxy stays live): stop Go, start Rust on the socket with `accountOwner: true`, same credential files and state directory. Go would move to a loopback port with no credentials for what the old dashboard still needs; forwarding those paths to it and posting receipts into Go's usage store aren't built, since the cutover is off. Rollback: re-enable the Go unit on the socket, same credential files.
-3. **Usage service** replaces the Go process; then Go is retired.
+1. **Shadow**: a spare loopback port, `accountOwner: false`, the fork's credential files read-only, so real Claude Code requests can be compared on every account and key.
+2. **Switch**: stop the Go fork, start this on the same socket with `accountOwner: true`, the same credential files and state directory. Rollback: start the Go fork again on the same files.

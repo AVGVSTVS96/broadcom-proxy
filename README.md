@@ -1,24 +1,77 @@
 # broadcom-proxy
 
-A Claude account pool. Point Claude Code at it and every request goes out on the subscription plan with the most room, ranked by five-hour and weekly limits, each session kept on its account until that account nears a cutoff. An API key is the last resort: used only when every plan is out, and only while its account has extra usage turned on.
+One address for all your Claude subscriptions. Point Claude Code at it and each request goes out on the plan with the most room left, so several Pro or Max accounts work like one bigger one.
 
-It forwards what Claude Code sends and swaps only the credential. No client disguise, no prompt rewriting, no TLS games.
+It's a small Rust port of the Claude account pool in [AVGVSTVS96/CLIProxyAPI](https://github.com/AVGVSTVS96/CLIProxyAPI), a fork of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), and reads CLIProxyAPI's login files, so the two can share them. It forwards what Claude Code sends and swaps only the credential: no client disguise, no prompt rewriting, no TLS games.
+
+```
+claude ─┐                        ┌─▶ Max account A
+claude ─┼─▶ broadcom-proxy ──────┼─▶ Max account B
+claude ─┘   127.0.0.1:8317       └─▶ Pro account C   (API key: last resort)
+```
+
+## Start
 
 ```sh
-cargo install --path .
-cp config.example.json ~/.config/broadcom-proxy/config.json   # then edit
-broadcom-proxy ~/.config/broadcom-proxy/config.json
+cargo install --git https://github.com/AVGVSTVS96/broadcom-proxy
+broadcom-proxy login     # once per Claude account: open the link, paste the code
+broadcom-proxy           # serves on 127.0.0.1:8317
 ```
+
+The first run writes a client key to `~/.config/broadcom-proxy/client-keys`. Give it to Claude Code:
 
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:8317 \
-ANTHROPIC_CUSTOM_HEADERS="X-Api-Key: <a client key>" claude
+ANTHROPIC_CUSTOM_HEADERS="X-Api-Key: $(head -1 ~/.config/broadcom-proxy/client-keys)" \
+claude
 ```
 
-- **Routing**: ranked plans, session affinity, failover before the first byte, API keys last and only with extra usage on. See [DESIGN.md](DESIGN.md).
-- **Accounts**: OAuth logins are one JSON file each (CLIProxyAPI's format); add Claude and ChatGPT logins from any device through the management API. Exactly one running proxy should have `accountOwner: true`: it refreshes tokens, which rotate.
-- **Records**: `receipts.ndjson` (one line per upstream attempt, with Anthropic's usage), limit history, session moves and held resets spent, as append-only files in the state directory.
-- **Management**: `/v8/management/...` with a bearer key, including a live SSE stream of every account's standing.
-- **systemd**: `systemd/` has a socket unit that holds the port across restarts and a service that drains in-flight streams on stop.
+## How it picks an account
+
+1. **Plans first.** Accounts under their cutoffs (90% of the five-hour limit, 98% of the week) come first: one holding a reset, then one with comfortable room per running agent, then the one whose week would otherwise reset unused, then the most room. Agent SDK and `claude -p` sessions count 1.7× against the five-hour limit, since they drain it faster.
+2. **Sessions stay put.** A Claude Code session keeps its account, so its prompt cache stays warm, until that account passes a cutoff, or nears one while a calm account is free.
+3. **Failover before the first byte.** When an account hits its limit or is signed out, the request goes to the next one in the same call, and that account sits out until it can serve again. An overloaded one just passes the request on.
+4. **API keys last.** A plan's usage is worth far more than the same money in API credit, so a key is tried only after every plan has failed or is sitting out, and only while the plan account it names has extra usage turned on in Claude's settings. That switch is the owner's yes to paying past the plan; while it's off, the key is never spent.
+5. **Held resets.** When every account has used its week, the pool spends a held weekly reset, if one has any.
+
+## Config
+
+Optional. Without a file at `~/.config/broadcom-proxy/config.json` (or the path given as the argument), every default applies. A config with every field is in [config.example.json](config.example.json).
+
+| Field | Default | What it is |
+|---|---|---|
+| `listen` | `127.0.0.1:8317` | Address to serve on, unless systemd passes a socket |
+| `accountOwner` | `true` | Refreshes tokens, writes logins, spends resets. Only one process per login directory may: refresh tokens rotate |
+| `clientKeysFile` | `~/.config/broadcom-proxy/client-keys` | Keys clients send, one per line; written on first run |
+| `managementKeyFile` | `~/.config/broadcom-proxy/management-key` | Bearer key for the management API; written on first run |
+| `credentialsDir` | `~/.config/broadcom-proxy/auths` | One JSON file per login, in CLIProxyAPI's format |
+| `stateDir` | `~/.local/state/broadcom-proxy` | Receipts, limit history, session moves |
+| `apiKeys` | none | `[{"name", "keyFile", "account"}]`; `account` is the email of the plan login whose extra-usage switch gates the key |
+| `policy` | `{"sessionCutoff": 90, "weeklyCutoff": 98, "agentsPerAccount": 100}` | Cutoffs, also settable over the API |
+| `agentSdkFactor` | `1.7` | How much faster Agent SDK sessions drain the five-hour limit |
+| `resetCommand` | none | Run as `sh -c '<command> "$1"'` with a line about each reset spent or refused |
+| `accountsFile` | none | Where to write the account list, for tools that name accounts by id |
+
+## Keep it running
+
+`systemd/` has a user socket that holds the port across restarts, so clients queue instead of failing, and a service that gives requests in flight 10 minutes to finish on stop:
+
+```sh
+cp systemd/* ~/.config/systemd/user/
+systemctl --user enable --now broadcom-proxy.socket
+```
+
+## Coming from CLIProxyAPI
+
+Set `credentialsDir` to CLIProxyAPI's auth directory (`~/.cli-proxy-api` unless you changed it). Stop CLIProxyAPI before starting this one with `accountOwner: true`, or run this one with `accountOwner: false` beside it to compare. Going back is starting CLIProxyAPI on the same files.
+
+## What it writes and serves
+
+- `receipts.ndjson`: one line per upstream attempt, with Anthropic's usage object as sent. Also limit history, session moves and resets spent, all append-only in the state directory.
+- `/v8/management/...` with the management key: accounts, pool standing as a live SSE stream, policy, sign-ins from any device, reset spending. [BROADCOM](https://github.com/AVGVSTVS96/broadcom) is a dashboard built on it.
+
+How it works inside, and why: [DESIGN.md](DESIGN.md).
+
+Pooling several subscriptions is between you and Anthropic's terms for your plans.
 
 MIT licensed.
