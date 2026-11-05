@@ -27,14 +27,18 @@ const CREDIT_LOW: &str = r#"{"type":"error","error":{"type":"invalid_request_err
 struct Seen {
     credential: String,
     authorization: bool,
+    user_agent: String,
     body: Value,
 }
+
+/// A canned answer: status, body and extra headers.
+type Answer = (u16, String, Vec<(String, String)>);
 
 #[derive(Default)]
 struct Upstream {
     seen: Mutex<Vec<Seen>>,
     /// How each credential answers; anything not listed answers 200.
-    answers: Mutex<HashMap<String, (u16, String, Vec<(String, String)>)>>,
+    answers: Mutex<HashMap<String, Answer>>,
 }
 
 impl Upstream {
@@ -61,12 +65,15 @@ async fn anthropic(State(up): State<Arc<Upstream>>, uri: Uri, headers: HeaderMap
     up.seen.lock().unwrap().push(Seen {
         credential: credential.clone(),
         authorization: !header("authorization").is_empty(),
+        user_agent: header("user-agent"),
         body: serde_json::from_slice(&body).unwrap_or_default(),
     });
     if let Some((status, body, extra)) = up.answers.lock().unwrap().get(&credential).cloned() {
         let mut response = (StatusCode::from_u16(status).unwrap(), body).into_response();
         for (k, v) in extra {
-            response.headers_mut().insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+            response
+                .headers_mut()
+                .insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
         }
         return response;
     }
@@ -123,7 +130,12 @@ async fn pool(keys: &[(&str, i64)]) -> Pool {
     let up = Arc::new(Upstream::default());
     let upstream = serve(Router::new().fallback(anthropic).with_state(up.clone())).await;
     let (config, revision) = Config::load(&at("config.json")).unwrap();
-    let ends = Endpoints { anthropic: upstream.clone(), claude_platform: upstream.clone(), claude_ai: upstream.clone(), openai_auth: upstream };
+    let ends = Endpoints {
+        anthropic: upstream.clone(),
+        claude_platform: upstream.clone(),
+        claude_ai: upstream.clone(),
+        openai_auth: upstream,
+    };
     let app = Arc::new(App::new(at("config.json"), config, revision, ends).unwrap());
     let proxy = serve(broadcom_proxy::router(app)).await;
     Pool { proxy, up, dir, http: reqwest::Client::new() }
@@ -182,7 +194,11 @@ async fn credit_goes_first_by_priority_then_falls_through_to_the_plans() {
 #[tokio::test]
 async fn a_request_error_on_a_funded_key_goes_back_to_the_client() {
     let p = pool(&[("key-hi", 300)]).await;
-    p.up.answer("key-hi", 400, r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#);
+    p.up.answer(
+        "key-hi",
+        400,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+    );
     let (status, body) = p.send("claude-x", None).await;
     assert_eq!(status, 400);
     assert_eq!(body["error"]["message"], "prompt is too long");
@@ -199,6 +215,7 @@ async fn keys_get_the_key_and_plans_get_their_token_never_the_clients() {
     assert!(!seen[0].authorization, "a key request carried an Authorization header");
     assert!(seen[2].credential.starts_with("token-"));
     assert!(seen.iter().all(|s| s.credential != "the-clients-own-claude-token" && s.credential != "client-key"));
+    assert!(seen.iter().all(|s| s.user_agent == "claude-cli/2.1.318 (external, sdk-cli)"), "{seen:?}");
 }
 
 #[tokio::test]
@@ -232,11 +249,16 @@ async fn a_rejected_limit_cools_the_account_and_the_session_moves() {
     let first = p.up.served().remove(0);
     let other = if first == "token-a" { "token-b" } else { "token-a" };
     let reset = (jiff::Timestamp::now().as_second() + 3600).to_string();
-    p.up.answer_with(&first, 429, "{}", &[
-        ("anthropic-ratelimit-unified-status", "rejected"),
-        ("anthropic-ratelimit-unified-5h-status", "rejected"),
-        ("anthropic-ratelimit-unified-5h-reset", &reset),
-    ]);
+    p.up.answer_with(
+        &first,
+        429,
+        "{}",
+        &[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-reset", &reset),
+        ],
+    );
     assert_eq!(p.send("claude-x", Some(SESSION)).await.0, 200);
     assert_eq!(p.up.served(), [first.clone(), other.to_string()]);
     assert_eq!(p.send("claude-x", Some(SESSION)).await.0, 200);
@@ -260,10 +282,12 @@ async fn a_session_stays_on_its_account_until_it_nears_a_cutoff() {
     assert_eq!(p.up.served(), vec![first.clone(); 3]);
 
     let reset = (jiff::Timestamp::now().as_second() + 3600).to_string();
-    p.up.answer_with(&first, 200, r#"{"id":"m","usage":{}}"#, &[
-        ("anthropic-ratelimit-unified-5h-utilization", "0.85"),
-        ("anthropic-ratelimit-unified-5h-reset", &reset),
-    ]);
+    p.up.answer_with(
+        &first,
+        200,
+        r#"{"id":"m","usage":{}}"#,
+        &[("anthropic-ratelimit-unified-5h-utilization", "0.85"), ("anthropic-ratelimit-unified-5h-reset", &reset)],
+    );
     p.send("claude-x", Some(SESSION)).await;
     p.send("claude-x", Some(SESSION)).await;
     let served = p.up.served();
@@ -277,8 +301,16 @@ async fn a_session_stays_on_its_account_until_it_nears_a_cutoff() {
 #[tokio::test]
 async fn a_refused_token_is_reread_from_its_file_when_another_process_owns_the_accounts() {
     let p = pool(&[]).await;
-    p.up.answer("token-a", 401, r#"{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired."}}"#);
-    p.up.answer("token-b", 401, r#"{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired."}}"#);
+    p.up.answer(
+        "token-a",
+        401,
+        r#"{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired."}}"#,
+    );
+    p.up.answer(
+        "token-b",
+        401,
+        r#"{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired."}}"#,
+    );
     login(&p.dir.path().join("auths"), "a", "token-a2");
     assert_eq!(p.send("claude-x", None).await.0, 200);
     let served = p.up.served();

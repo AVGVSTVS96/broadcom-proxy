@@ -237,7 +237,7 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
                 {
                     app.seat(&inbound, id, route.moved, now);
                 }
-                log(&method, path, &target, status, &inbound, started);
+                log(&method, path, &target, status, &inbound, &response_headers, started);
                 let stream =
                     Tap::new(response.bytes_stream(), receipt, app.state_dir().to_path_buf(), &response_headers);
                 let mut out = Response::new(Body::from_stream(stream));
@@ -250,7 +250,7 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
                 receipt.read_body(&bytes, false);
                 receipt.write(app.state_dir());
             }
-            log(&method, path, &target, status, &inbound, started);
+            log(&method, path, &target, status, &inbound, &response_headers, started);
             let mut answer = Response::new(Body::from(bytes.clone()));
             *answer.status_mut() = status;
             *answer.headers_mut() = client_headers(&response_headers);
@@ -281,17 +281,34 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
     })
 }
 
-fn log(method: &Method, path: &str, target: &Target, status: StatusCode, inbound: &Inbound, started: i64) {
+/// One line per upstream attempt, with the account's limits as Anthropic just reported them.
+fn log(
+    method: &Method,
+    path: &str,
+    target: &Target,
+    status: StatusCode,
+    inbound: &Inbound,
+    headers: &HeaderMap,
+    started: i64,
+) {
     let credential = match target {
         Target::Key { name, .. } => name.as_str(),
         Target::Plan { id, .. } => id.as_str(),
     };
+    let utilization = |window: &str| {
+        headers
+            .get(format!("anthropic-ratelimit-unified-{window}-utilization"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+    };
     println!(
-        "{method} {} {} credential={credential} model={} entrypoint={} ms={}",
+        "{method} {} {} credential={credential} model={} entrypoint={} 5h={} 7d={} ms={}",
         path.split('?').next().unwrap_or(path),
         status.as_u16(),
         inbound.model,
         inbound.entrypoint,
+        utilization("5h"),
+        utilization("7d"),
         files::now_ms() - started
     );
 }

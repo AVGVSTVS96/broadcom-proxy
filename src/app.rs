@@ -133,6 +133,7 @@ impl App {
             config_path,
             ends,
             http: reqwest::Client::builder()
+                .user_agent(concat!("broadcom-proxy/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .read_timeout(std::time::Duration::from_secs(600))
                 .build()?,

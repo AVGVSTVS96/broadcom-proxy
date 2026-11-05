@@ -20,14 +20,12 @@ const PLAN_EVERY: i64 = 24 * HOUR;
 const FRESH_RESETS: i64 = 2 * MINUTE;
 const CLAIM_BACKOFF: i64 = 5 * MINUTE;
 const SETTLE: i64 = HOUR;
-const USER_AGENT: &str = concat!("broadcom-proxy/", env!("CARGO_PKG_VERSION"));
 
 pub async fn anthropic_get(app: &App, token: &str, path: &str) -> reqwest::Result<reqwest::Response> {
     app.http
         .get(format!("{}{path}", app.ends.anthropic))
         .bearer_auth(token)
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", USER_AGENT)
         .timeout(Duration::from_secs(15))
         .send()
         .await
@@ -390,7 +388,6 @@ async fn claim_reset(app: &App, token: &str, org: &str, claim: &Claim) -> (u16, 
         .post(format!("{}/api/organizations/{org}/reset_rate_limits", app.ends.anthropic))
         .bearer_auth(token)
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", USER_AGENT)
         .json(&json!({"program": "cedar_ember", "grant_id": claim.grant, "request_id": claim.request_id}))
         .timeout(Duration::from_secs(30))
         .send()

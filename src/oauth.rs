@@ -182,11 +182,7 @@ async fn refresh(app: &App, login: &mut Login) -> Result<(), RefreshError> {
 }
 
 fn claude_token_request(app: &App) -> reqwest::RequestBuilder {
-    // Anthropic's token endpoint sees Claude Code's own HTTP client on this client id.
-    app.http
-        .post(format!("{}/v1/oauth/token", app.ends.claude_platform))
-        .header("accept", "application/json, text/plain, */*")
-        .header("user-agent", "axios/1.15.2")
+    app.http.post(format!("{}/v1/oauth/token", app.ends.claude_platform))
 }
 
 #[derive(Deserialize)]
