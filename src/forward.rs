@@ -222,12 +222,6 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
     let route = app.route(&inbound, started);
     let path = uri.path_and_query().map_or(uri.path(), |p| p.as_str());
     let url = format!("{}{path}", app.ends.anthropic);
-    let unprefixed = route.unprefixed.as_ref().map(|model| {
-        let mut doc: Value = serde_json::from_slice(&body).unwrap_or_default();
-        doc["model"] = model.clone().into();
-        Bytes::from(serde_json::to_vec(&doc).unwrap_or_default())
-    });
-    let body = unprefixed.unwrap_or(body);
     let log = Log { method: &method, path, inbound: &inbound, started };
     let mut last = None;
     let route_free_at = route.free_at;
@@ -675,7 +669,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         for split in [1, 7, 64, stream.len()] {
-            let inbound = Inbound { model: "included/claude-x".into(), ..Inbound::default() };
+            let inbound = Inbound { model: "claude-x".into(), ..Inbound::default() };
             let receipt = Receipt::new(&inbound, &plan(), StatusCode::OK, &HeaderMap::new(), NOW);
             let sse = headers(&[("content-type", "text/event-stream; charset=utf-8")]);
             let mut tap = Tap::new((), Some(receipt), dir.path().to_path_buf(), &sse);

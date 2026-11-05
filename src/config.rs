@@ -38,15 +38,15 @@ pub struct Config {
     pub reset_command: Option<String>,
 }
 
-/// An API key with credit: it serves bare model names before any plan, highest priority first.
+/// An API key, the pool's last resort: tried only after every plan account, and only while
+/// `account` has extra usage turned on.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApiKeyConfig {
     pub name: String,
     pub key_file: PathBuf,
-    /// `<prefix>/<model>` asks for this key's credit and nothing else.
-    pub prefix: String,
-    pub priority: i64,
+    /// The email of the plan login whose extra-usage setting decides whether this key may spend.
+    pub account: String,
 }
 
 fn default_sdk_factor() -> f64 {

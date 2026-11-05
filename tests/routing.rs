@@ -8,7 +8,6 @@ use std::{
 
 use axum::{
     Router,
-    body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -22,13 +21,12 @@ use serde_json::{Value, json};
 const SESSION: &str = "51933568-42b8-4c8e-bc44-2bed00731a66";
 const CREDIT_LOW: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#;
 
-/// What the stand-in saw: the credential each call came in on and the body it carried.
+/// What the stand-in saw: the credential each call came in on.
 #[derive(Clone, Debug)]
 struct Seen {
     credential: String,
     authorization: bool,
     user_agent: String,
-    body: Value,
 }
 
 /// A canned answer: status, body and extra headers.
@@ -56,7 +54,7 @@ impl Upstream {
     }
 }
 
-async fn anthropic(State(up): State<Arc<Upstream>>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+async fn anthropic(State(up): State<Arc<Upstream>>, uri: Uri, headers: HeaderMap) -> Response {
     let header = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let credential = match header("x-api-key") {
         key if !key.is_empty() => key,
@@ -66,7 +64,6 @@ async fn anthropic(State(up): State<Arc<Upstream>>, uri: Uri, headers: HeaderMap
         credential: credential.clone(),
         authorization: !header("authorization").is_empty(),
         user_agent: header("user-agent"),
-        body: serde_json::from_slice(&body).unwrap_or_default(),
     });
     if let Some((status, body, extra)) = up.answers.lock().unwrap().get(&credential).cloned() {
         let mut response = (StatusCode::from_u16(status).unwrap(), body).into_response();
@@ -105,8 +102,8 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-/// Plan accounts `a` and `b` (tokens `token-a`, `token-b`) and credit keys `key-hi` and `key-lo`.
-async fn pool(keys: &[(&str, i64)]) -> Pool {
+/// Plan accounts `a` and `b` (tokens `token-a`, `token-b`) and API keys, each with its account's email.
+async fn pool(keys: &[(&str, &str)]) -> Pool {
     let dir = tempfile::tempdir().unwrap();
     let at = |p: &str| dir.path().join(p);
     write(&at("client-keys"), "client-key\n");
@@ -116,9 +113,9 @@ async fn pool(keys: &[(&str, i64)]) -> Pool {
     }
     let api_keys: Vec<Value> = keys
         .iter()
-        .map(|(key, priority)| {
+        .map(|(key, account)| {
             write(&at(key), key);
-            json!({"name": key, "keyFile": at(key), "prefix": "included", "priority": priority})
+            json!({"name": key, "keyFile": at(key), "account": account})
         })
         .collect();
     let config = json!({
@@ -166,69 +163,87 @@ impl Pool {
         (response.status().as_u16(), response.json().await.unwrap_or_default())
     }
 
+    /// Turns extra usage on for plan account `id`, as its usage endpoint would report it.
+    fn extra_usage(&self, id: &str) {
+        self.app.state().account_mut(id).unwrap().extra_usage = true;
+    }
+
+    /// Every plan account sits out, as if each had hit its limit.
+    fn plans_out(&self) {
+        for a in &mut self.app.state().accounts {
+            a.cool_until = i64::MAX;
+        }
+    }
+
     fn file(&self, name: &str) -> String {
         std::fs::read_to_string(self.dir.path().join("state").join(name)).unwrap_or_default()
     }
 }
 
 #[tokio::test]
-async fn credit_goes_first_by_priority_then_falls_through_to_the_plans() {
-    let p = pool(&[("key-lo", 100), ("key-hi", 300)]).await;
+async fn plans_go_first_and_a_key_waits_for_its_accounts_extra_usage() {
+    let p = pool(&[("key-a", "a@example.com"), ("key-b", "B@example.com")]).await;
     assert_eq!(p.send("claude-x", None).await.0, 200);
-    assert_eq!(p.up.served(), ["key-hi"]);
+    assert!(p.up.served()[0].starts_with("token-"), "a plan serves while one has room");
 
-    p.up.answer("key-hi", 400, CREDIT_LOW);
+    p.plans_out();
+    let (status, _) = p.send("claude-x", None).await;
+    assert_eq!(status, 429, "with extra usage off everywhere, no key is spent");
+    assert!(p.up.served().is_empty());
+
+    p.extra_usage("b");
     assert_eq!(p.send("claude-x", None).await.0, 200);
-    assert_eq!(p.up.served(), ["key-hi", "key-lo"]);
+    assert_eq!(p.up.served(), ["key-b"], "only the key whose account has extra usage on");
 
-    p.up.answer("key-lo", 400, CREDIT_LOW);
+    p.extra_usage("a");
+    p.up.answer("key-a", 400, CREDIT_LOW);
+    assert_eq!(p.send("claude-x", None).await.0, 200);
+    assert_eq!(p.up.served(), ["key-a", "key-b"], "an empty key cools and the next is tried");
+}
+
+#[tokio::test]
+async fn a_key_comes_after_every_plan_fails() {
+    let p = pool(&[("key-a", "a@example.com")]).await;
+    p.extra_usage("a");
+    let overloaded = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+    p.up.answer("token-a", 529, overloaded);
+    p.up.answer("token-b", 529, overloaded);
     assert_eq!(p.send("claude-x", None).await.0, 200);
     let served = p.up.served();
-    assert_eq!(served.len(), 2, "key-hi still cools, so only key-lo is tried before a plan: {served:?}");
-    assert_eq!(served[0], "key-lo");
-    assert!(served[1].starts_with("token-"));
-
-    assert_eq!(p.send("claude-x", None).await.0, 200);
-    assert_eq!(p.up.served().len(), 1, "with every key cooling the plan is reached directly");
+    assert_eq!(served.len(), 3);
+    assert!(served[..2].iter().all(|s| s.starts_with("token-")));
+    assert_eq!(served[2], "key-a");
 }
 
 #[tokio::test]
 async fn a_request_error_on_a_funded_key_goes_back_to_the_client() {
-    let p = pool(&[("key-hi", 300)]).await;
+    let p = pool(&[("key-a", "a@example.com")]).await;
+    p.extra_usage("a");
+    p.plans_out();
     p.up.answer(
-        "key-hi",
+        "key-a",
         400,
         r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
     );
     let (status, body) = p.send("claude-x", None).await;
     assert_eq!(status, 400);
     assert_eq!(body["error"]["message"], "prompt is too long");
-    assert_eq!(p.up.served(), ["key-hi"]);
+    assert_eq!(p.up.served(), ["key-a"]);
 }
 
 #[tokio::test]
 async fn keys_get_the_key_and_plans_get_their_token_never_the_clients() {
-    let p = pool(&[("key-hi", 300)]).await;
+    let p = pool(&[("key-a", "a@example.com")]).await;
     p.send("claude-x", None).await;
-    p.up.answer("key-hi", 400, CREDIT_LOW);
+    p.extra_usage("a");
+    p.plans_out();
     p.send("claude-x", None).await;
     let seen = std::mem::take(&mut *p.up.seen.lock().unwrap());
-    assert!(!seen[0].authorization, "a key request carried an Authorization header");
-    assert!(seen[2].credential.starts_with("token-"));
+    assert!(seen[0].credential.starts_with("token-") && seen[0].authorization);
+    assert_eq!(seen[1].credential, "key-a");
+    assert!(!seen[1].authorization, "a key request carried an Authorization header");
     assert!(seen.iter().all(|s| s.credential != "the-clients-own-claude-token" && s.credential != "client-key"));
     assert!(seen.iter().all(|s| s.user_agent == "claude-cli/2.1.318 (external, sdk-cli)"), "{seen:?}");
-}
-
-#[tokio::test]
-async fn a_prefixed_model_uses_only_credit_and_goes_out_bare() {
-    let p = pool(&[("key-hi", 300)]).await;
-    assert_eq!(p.send("included/claude-x", None).await.0, 200);
-    let seen = std::mem::take(&mut *p.up.seen.lock().unwrap());
-    assert_eq!(seen[0].body["model"], "claude-x");
-
-    p.up.answer("key-hi", 400, CREDIT_LOW);
-    assert_eq!(p.send("included/claude-x", None).await.0, 400, "credit-only requests never reach a plan");
-    assert_eq!(p.up.served(), ["key-hi"]);
 }
 
 #[tokio::test]
@@ -321,17 +336,20 @@ async fn a_refused_token_is_reread_from_its_file_when_another_process_owns_the_a
 
 #[tokio::test]
 async fn receipts_record_every_attempt() {
-    let p = pool(&[("key-hi", 300)]).await;
-    p.up.answer("key-hi", 400, CREDIT_LOW);
+    let p = pool(&[("key-a", "a@example.com")]).await;
+    p.extra_usage("a");
+    let overloaded = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+    p.up.answer("token-a", 529, overloaded);
+    p.up.answer("token-b", 529, overloaded);
     p.send("claude-x", Some(SESSION)).await;
     let receipts: Vec<Value> = p.file("receipts.ndjson").lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(receipts.len(), 2);
-    assert_eq!((receipts[0]["failed"].as_bool(), receipts[0]["status"].as_u64()), (Some(true), Some(400)));
-    assert!(receipts[0]["accountId"].as_str().unwrap().starts_with("claude:apikey:"));
-    assert_eq!(receipts[1]["responseId"], "msg_1");
-    assert_eq!(receipts[1]["inputTokens"], 3);
-    assert_eq!(receipts[1]["sessionId"], SESSION);
-    assert_eq!(receipts[1]["entrypoint"], "sdk-cli");
+    assert_eq!(receipts.len(), 3);
+    assert_eq!((receipts[0]["failed"].as_bool(), receipts[0]["status"].as_u64()), (Some(true), Some(529)));
+    assert!(receipts[2]["accountId"].as_str().unwrap().starts_with("claude:apikey:"));
+    assert_eq!(receipts[2]["responseId"], "msg_1");
+    assert_eq!(receipts[2]["inputTokens"], 3);
+    assert_eq!(receipts[2]["sessionId"], SESSION);
+    assert_eq!(receipts[2]["entrypoint"], "sdk-cli");
 }
 
 #[tokio::test]
@@ -346,7 +364,7 @@ async fn a_client_without_a_proxy_key_is_turned_away() {
 
 #[tokio::test]
 async fn count_tokens_and_models_route_like_messages() {
-    let p = pool(&[("key-hi", 300)]).await;
+    let p = pool(&[]).await;
     let count = p
         .http
         .post(format!("{}/v1/messages/count_tokens?beta=true", p.proxy))
@@ -358,7 +376,7 @@ async fn count_tokens_and_models_route_like_messages() {
     assert_eq!(count.json::<Value>().await.unwrap()["input_tokens"], 42);
     let models = p.http.get(format!("{}/v1/models", p.proxy)).header("x-api-key", "client-key").send().await.unwrap();
     assert_eq!(models.status(), 200);
-    assert_eq!(p.up.served(), ["key-hi", "key-hi"]);
+    assert!(p.up.served().iter().all(|s| s.starts_with("token-")));
     assert!(p.file("receipts.ndjson").is_empty(), "only messages leave receipts");
 }
 
@@ -459,19 +477,32 @@ async fn a_policy_saves_only_at_the_revision_it_was_read_at() {
 
 #[tokio::test]
 async fn with_every_credential_sitting_out_the_client_hears_when_the_pool_frees_up() {
-    let p = pool(&[("key-hi", 300)]).await;
-    p.up.answer("key-hi", 400, CREDIT_LOW);
-    let send = || {
-        p.http
-            .post(format!("{}/v1/messages", p.proxy))
-            .header("x-api-key", "client-key")
-            .json(&json!({"model": "included/claude-x"}))
-            .send()
-    };
-    assert_eq!(send().await.unwrap().status(), 400);
-    let answer = send().await.unwrap();
+    let p = pool(&[]).await;
+    let reset = (jiff::Timestamp::now().as_second() + 30).to_string();
+    for token in ["token-a", "token-b"] {
+        p.up.answer_with(
+            token,
+            429,
+            "{}",
+            &[
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-reset", &reset),
+            ],
+        );
+    }
+    assert_eq!(p.send("claude-x", None).await.0, 429);
+    assert_eq!(p.up.served().len(), 2);
+    let answer = p
+        .http
+        .post(format!("{}/v1/messages", p.proxy))
+        .header("x-api-key", "client-key")
+        .json(&json!({"model": "claude-x"}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(answer.status(), 429);
     let wait: i64 = answer.headers()["retry-after"].to_str().unwrap().parse().unwrap();
     assert!((1..=60).contains(&wait), "{wait}");
-    assert_eq!(p.up.served(), ["key-hi"]);
+    assert!(p.up.served().is_empty());
 }

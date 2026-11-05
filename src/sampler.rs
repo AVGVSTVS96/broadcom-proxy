@@ -95,6 +95,8 @@ async fn read_plan(app: &App, account: &str, token: &str, now: i64) {
 struct Usage {
     five_hour: Option<UsageWindow>,
     seven_day: Option<UsageWindow>,
+    #[serde(rename = "extra_usage")]
+    extra: Option<ExtraUsage>,
     iguana_necktie: Option<CloudAnswer>,
     cedar_ember: Option<Grants>,
     juniper_tide: Option<AtLimitAnswer>,
@@ -113,6 +115,11 @@ impl UsageWindow {
             resets_at: self.resets_at.as_deref().and_then(files::parse_ms).unwrap_or(0),
         })
     }
+}
+
+#[derive(Deserialize)]
+struct ExtraUsage {
+    is_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -136,9 +143,9 @@ struct AtLimitAnswer {
     next_available_at: Option<String>,
 }
 
-/// Reads an account's limits and held resets from Anthropic's usage endpoint.
+/// Reads an account's limits, extra-usage setting and held resets from Anthropic's usage endpoint.
 pub async fn read_usage(app: &App, account: &str, token: &str, now: i64) {
-    let response = anthropic_get(app, token, "/api/oauth/usage?cedar_ember=1&at_wall=1&skip_spend=1").await;
+    let response = anthropic_get(app, token, "/api/oauth/usage?cedar_ember=1&at_wall=1").await;
     let Ok(response) = response else { return };
     let status = response.status().as_u16();
     let retry =
@@ -151,6 +158,7 @@ pub async fn read_usage(app: &App, account: &str, token: &str, now: i64) {
         a.sample_after = now + retry.map_or(15 * MINUTE, |s| s * 1000);
     }
     let Some(body) = body else { return };
+    a.extra_usage = body.extra.is_some_and(|e| e.is_enabled);
     a.cloud = body.iguana_necktie.map(|c| Cloud {
         limit: c.limit_dollars,
         used: c.used_dollars,

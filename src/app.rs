@@ -99,12 +99,10 @@ pub struct Inbound {
     pub entrypoint: String,
 }
 
-/// The credentials to try for a request, in order, and the body's model name for each kind.
+/// The credentials to try for a request, in order.
 #[derive(Debug, Default)]
 pub struct Route {
     pub targets: Vec<Target>,
-    /// The model with its credit prefix stripped, when the client asked for one.
-    pub unprefixed: Option<String>,
     /// Why the session's account isn't first, if it had one.
     pub moved: Option<Cause>,
     /// When the first credential that's sitting out comes back.
@@ -219,35 +217,11 @@ impl App {
         weight(entrypoint, self.config.agent_sdk_factor)
     }
 
-    /// Credit first: a bare model goes to API keys with credit, highest priority first, then
-    /// to the plans in rank order, the session's own account first unless it should move.
-    /// `<prefix>/<model>` goes only to the keys with that prefix.
+    /// Plans first, in rank order, the session's own account first unless it should move.
+    /// API keys come last, and only those whose account has extra usage on.
     pub fn route(&self, inbound: &Inbound, now: i64) -> Route {
         let state = self.state();
         let mut route = Route::default();
-        let (prefix, bare) = inbound.model.split_once('/').unwrap_or(("", &inbound.model));
-        let prefixed = !prefix.is_empty() && state.keys.iter().any(|k| k.prefix == prefix);
-        let keys_cooling =
-            state.keys.iter().filter(|k| k.cool_until > now && (!prefixed || k.prefix == prefix)).map(|k| k.cool_until);
-        let plans_cooling = state
-            .accounts
-            .iter()
-            .filter(|a| !prefixed && !a.login.disabled() && a.cool_until > now)
-            .map(|a| a.cool_until);
-        route.free_at = keys_cooling.chain(plans_cooling).min();
-        let mut keys: Vec<&ApiKey> =
-            state.keys.iter().filter(|k| k.cool_until <= now && (!prefixed || k.prefix == prefix)).collect();
-        keys.sort_by_key(|k| std::cmp::Reverse(k.priority));
-        route.targets.extend(keys.into_iter().map(|k| Target::Key {
-            id: k.id.clone(),
-            name: k.name.clone(),
-            key: k.key.clone(),
-        }));
-        if prefixed {
-            route.unprefixed = Some(bare.to_string());
-            return route;
-        }
-
         let available: Vec<&Account> =
             state.accounts.iter().filter(|a| !a.login.disabled() && a.cool_until <= now).collect();
         let weight = self.weight(&inbound.entrypoint);
@@ -272,6 +246,26 @@ impl App {
             let a = available[i];
             Target::Plan { id: a.id(), token: a.login.get("access_token").to_string() }
         }));
+
+        let keys: Vec<&ApiKey> = state
+            .keys
+            .iter()
+            .filter(|k| {
+                state
+                    .accounts
+                    .iter()
+                    .any(|a| a.extra_usage && !a.login.disabled() && a.label().eq_ignore_ascii_case(k.account.trim()))
+            })
+            .collect();
+        route.targets.extend(keys.iter().filter(|k| k.cool_until <= now).map(|k| Target::Key {
+            id: k.id.clone(),
+            name: k.name.clone(),
+            key: k.key.clone(),
+        }));
+        let plans_cooling =
+            state.accounts.iter().filter(|a| !a.login.disabled() && a.cool_until > now).map(|a| a.cool_until);
+        let keys_cooling = keys.iter().filter(|k| k.cool_until > now).map(|k| k.cool_until);
+        route.free_at = plans_cooling.chain(keys_cooling).min();
         route
     }
 

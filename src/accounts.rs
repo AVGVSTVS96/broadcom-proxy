@@ -91,6 +91,8 @@ pub struct Account {
     /// The last reading written to the history, so it records only real moves.
     pub logged: Reading,
     pub cloud: Option<Cloud>,
+    /// Whether the account may pay past its plan, as its usage endpoint last said.
+    pub extra_usage: bool,
     pub resets: Vec<Reset>,
     pub at_limit: Option<AtLimit>,
     pub resets_read_at: i64,
@@ -111,6 +113,7 @@ impl Account {
             reading: Reading::default(),
             logged: Reading::default(),
             cloud: None,
+            extra_usage: false,
             resets: Vec::new(),
             at_limit: None,
             resets_read_at: 0,
@@ -210,15 +213,14 @@ pub struct Spent {
     pub until: i64,
 }
 
-/// An API key with credit.
+/// An API key, spent only while its account has extra usage on.
 #[derive(Debug)]
 pub struct ApiKey {
     pub name: String,
-    /// The id CLIProxyAPI gave this key, so records keep joining across the switch.
+    /// The id CLIProxyAPI gives the same key, so records join across both proxies.
     pub id: String,
     pub key: String,
-    pub prefix: String,
-    pub priority: i64,
+    pub account: String,
     pub cool_until: i64,
 }
 
@@ -227,20 +229,19 @@ impl ApiKey {
         let key = read_secret(&config.key_file)?;
         Ok(Self {
             name: config.name.clone(),
-            id: api_key_id(&key, &config.prefix),
+            id: api_key_id(&key),
             key,
-            prefix: config.prefix.clone(),
-            priority: config.priority,
+            account: config.account.clone(),
             cool_until: 0,
         })
     }
 }
 
-/// `claude:apikey:<hash>`, as CLIProxyAPI derives it from the key and its settings.
-pub fn api_key_id(key: &str, prefix: &str) -> String {
+/// `claude:apikey:<hash>`, as CLIProxyAPI derives it from a key without a prefix.
+pub fn api_key_id(key: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(b"claude:apikey");
-    for part in [key, "", "", prefix, ""] {
+    for part in [key, "", "", "", ""] {
         hash.update([0]);
         hash.update(part.trim().as_bytes());
     }

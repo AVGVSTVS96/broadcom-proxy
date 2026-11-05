@@ -7,7 +7,7 @@
   "stateDir": "~/.local/state/cliproxyapi",
   "accountsFile": "~/.config/cliproxyapi/accounts.json",
   "apiKeys": [
-    { "name": "team-credit", "keyFile": "~/.config/broadcom-proxy/secrets/api-key-team", "prefix": "included", "priority": 300 }
+    { "name": "spare-credit", "keyFile": "~/.config/broadcom-proxy/secrets/api-key", "account": "you@example.com" }
   ],
   "policy": { "sessionCutoff": 90, "weeklyCutoff": 98, "agentsPerAccount": 100 },
   "agentSdkFactor": 1.7,

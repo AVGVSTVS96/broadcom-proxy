@@ -17,9 +17,9 @@ agents ──/v1──▶ broadcom-proxy ──▶ api.anthropic.com
 ## What it does, and nothing else
 
 1. **Forward** `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models`. Answer `HEAD|GET /api/hello` and `/healthz` with 200.
-2. **Pick an account** per request: API credit first, then plans ranked by room. Keep a session on its account until it should move.
+2. **Pick an account** per request: plans ranked by room, the session's own account first until it should move. An API key only once every plan is out, and only while its account has extra usage on.
 3. **Keep accounts signed in**: refresh OAuth tokens before they expire, sign new ones in (Claude code-paste, ChatGPT device code).
-4. **Measure limits**: read them from every response's headers, and sample each account's usage, plan and held resets.
+4. **Measure limits**: read them from every response's headers, and sample each account's usage, extra-usage setting, plan and held resets.
 5. **Spend held resets** when every account has used its week.
 6. **Record**: one receipt per upstream attempt, one reading when a limit moves, one seat when a session lands on or leaves an account.
 7. **Serve** accounts, pool, sign-in and policy over HTTP, with a live stream.
@@ -31,7 +31,7 @@ Usage collection (transcripts, other machines, GitHub artifacts, pricing, the us
 Every client on the pool is a real Claude Code binary (CLI, Agent SDK, or Claude Code under hex, microscope or T3 Code). The proxy forwards what the client sent and changes only what routing requires:
 
 - **OAuth account**: `Authorization` becomes the account's bearer token; the client's own `Authorization` and `X-Api-Key` never leave. Body bytes untouched.
-- **API key**: `x-api-key` set to the key, `Authorization` dropped, and the OAuth-only betas (`oauth-*`, `claude-code-*`) dropped. Body bytes untouched, except a `<prefix>/` model name loses its prefix.
+- **API key**: `x-api-key` set to the key, `Authorization` dropped, and the OAuth-only betas (`oauth-*`, `claude-code-*`) dropped. Body bytes untouched.
 - **Responses** stream back byte for byte (decompressed), with upstream headers minus hop-by-hop ones and `set-cookie`, so `anthropic-ratelimit-unified-*` and `request-id` reach the client.
 - The proxy's own calls (sampler, token refresh, reset claims, sign-in) say `User-Agent: broadcom-proxy/<version>`. Anthropic's usage and profile endpoints answer it the same as Claude Code's own client (checked in the shadow run). The token endpoint was only probed with an invalid grant, which it refused the same way for both; a real refresh, reset claim or sign-in hasn't run against Anthropic yet, only against the stand-ins in `tests/owner.rs`.
 
@@ -43,9 +43,9 @@ One consequence, seen in the shadow run: Anthropic answers an OAuth request with
 
 Same decisions as the Go fork's pool, carried over deliberately (`src/pool.rs`, pure functions, table tests from the Go fork's `pool_test.go` and `pool_resets_test.go`):
 
-- **Credit first**: a bare model goes to the API keys first, highest priority first, as the bare model. A key that answers "credit balance is too low" cools for a minute and the request falls through to the next key, then the plans, in the same call. `<prefix>/<model>` (e.g. `included/claude-opus-5-5`) goes only to keys with that prefix. No per-key model lists: any model is tried on credit.
 - **Rank plans** (`pool::rank`): usable (5-hour < session cutoff, week < weekly cutoff, signed in) first; among usable, holders of a reset first, then comfortable room per agent, then known, then urgency to use the week before it resets, then room. Unusable: open ones by five-hour use, then soonest free. Agent SDK and `claude -p` sessions weigh `agentSdkFactor` (1.7) on the five-hour room.
 - **Session affinity**: key is `X-Claude-Code-Session-Id`, else `metadata.user_id.session_id` (UUIDs only). The seat is the binding: a session stays on its account while seen in the last 24 h, until `pool::move_away` says it's over a cutoff (any usable account takes it) or near one with a calm account free. A seated account that's cooling or turned off sends the session to the next ranked one.
+- **Plans first, API keys last**: a plan's usage is worth far more than the same dollars of API credit, so a key is the pool's last resort. It's tried only after every plan account (usable or not) has failed or is sitting out, and only while the plan account it names (`account`) has extra usage turned on, as that account's usage endpoint reports it. That's the switch that lets an account pay past its plan, so it's the owner's yes to spending; when it's off or unknown, the key isn't used. Keys go in config order; one that answers "credit balance is too low" cools for a minute and the next is tried.
 - **Failover, before the first byte only**, one pass over the credentials in order (no retry rounds: Claude Code retries on its own):
 
 | upstream | what happens |
@@ -61,7 +61,7 @@ Same decisions as the Go fork's pool, carried over deliberately (`src/pool.rs`, 
 | 408, 5xx, 529 | next credential, no cooldown: the trouble isn't the account's |
 | anything else | the request's own, back to the client |
 
-When every credential fails, the client gets the last answer; when none is available, a 503 `overloaded_error`.
+When every credential fails, the client gets the last answer; when every one is sitting out, a 429 `rate_limit_error` with `retry-after` set to when the first comes back.
 
 ## Data
 
@@ -93,7 +93,7 @@ Anything that writes credentials, refreshes or spends is refused (409) unless th
 
 ## Config
 
-One camelCase JSON file (`config.example.json`): listen address, `accountOwner`, client and management key files, credentials and state directories, the account list path, API keys (name, key file, prefix, priority), pool policy, `agentSdkFactor`, reset command. Secrets live in their own files, never inline.
+One camelCase JSON file (`config.example.json`): listen address, `accountOwner`, client and management key files, credentials and state directories, the account list path, API keys (name, key file, the account whose extra usage gates it), pool policy, `agentSdkFactor`, reset command. Secrets live in their own files, never inline.
 
 `accountOwner` makes this the one process that refreshes tokens, writes credential files and spends resets. Refresh tokens rotate when used, so a second refresher logs accounts out; a shadow runs with it off and rereads credential files the owner keeps current. Every write to a login (refresh, sign-in, turning it off) goes through one path under the state lock that lays only the changed fields onto the login as it stands, so a refresh can't undo a change made meanwhile or write back a removed login. A rescan takes a file only when it's newer than the copy held.
 

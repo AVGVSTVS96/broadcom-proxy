@@ -1,6 +1,6 @@
 # broadcom-proxy
 
-A Claude account pool. Point Claude Code at it and every request goes out on the account with the most room: API credit first, then subscription plans ranked by their five-hour and weekly limits, each session kept on its account until that account nears a cutoff.
+A Claude account pool. Point Claude Code at it and every request goes out on the subscription plan with the most room, ranked by five-hour and weekly limits, each session kept on its account until that account nears a cutoff. An API key is the last resort: used only when every plan is out, and only while its account has extra usage turned on.
 
 It forwards what Claude Code sends and swaps only the credential. No client disguise, no prompt rewriting, no TLS games.
 
@@ -15,7 +15,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8317 \
 ANTHROPIC_CUSTOM_HEADERS="X-Api-Key: <a client key>" claude
 ```
 
-- **Routing**: credit-first, ranked plans, session affinity, failover before the first byte. See [DESIGN.md](DESIGN.md).
+- **Routing**: ranked plans, session affinity, failover before the first byte, API keys last and only with extra usage on. See [DESIGN.md](DESIGN.md).
 - **Accounts**: OAuth logins are one JSON file each (CLIProxyAPI's format); add Claude and ChatGPT logins from any device through the management API. Exactly one running proxy should have `accountOwner: true`: it refreshes tokens, which rotate.
 - **Records**: `receipts.ndjson` (one line per upstream attempt, with Anthropic's usage), limit history, session moves and held resets spent, as append-only files in the state directory.
 - **Management**: `/v8/management/...` with a bearer key, including a live SSE stream of every account's standing.
