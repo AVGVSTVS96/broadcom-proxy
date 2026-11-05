@@ -48,17 +48,20 @@ pub fn classify(target: &Target, status: StatusCode, headers: &HeaderMap, body: 
         400 if text.contains("credit balance is too low") => Verdict::Cool(now + MINUTE),
         400 if text.contains("identity verification") => Verdict::Cool(now + 30 * MINUTE),
         429 => {
-            let rejected = |name: &str| header(&format!("anthropic-ratelimit-unified-{name}status")) == "rejected";
-            let mut until = now + seconds("retry-after").unwrap_or(10) * SECOND;
-            if rejected("") || rejected("5h-") || rejected("7d-") {
-                for window in ["5h-", "7d-", ""] {
-                    if rejected(window) || window.is_empty() {
-                        let reset = seconds(&format!("anthropic-ratelimit-unified-{window}reset")).unwrap_or(0);
-                        until = until.max(reset * SECOND);
-                    }
+            let rejected = |window: &str| header(&format!("anthropic-ratelimit-unified-{window}status")) == "rejected";
+            let after = now + seconds("retry-after").unwrap_or(10) * SECOND;
+            match target {
+                // A plan's 429 without a rejected window is the request's own: Anthropic answers
+                // Claude Code's startup quota probe that way on every account.
+                Target::Plan { .. } if !["", "5h-", "7d-"].into_iter().any(rejected) => Verdict::Answer,
+                Target::Plan { .. } => {
+                    let reset =
+                        |window: &str| seconds(&format!("anthropic-ratelimit-unified-{window}reset")).unwrap_or(0);
+                    let until = ["5h-", "7d-"].into_iter().filter(|w| rejected(w)).map(reset).chain([reset("")]).max();
+                    Verdict::Cool(after.max(until.unwrap_or(0) * SECOND).max(now + 10 * SECOND))
                 }
+                Target::Key { .. } => Verdict::Cool(after.max(now + 10 * SECOND)),
             }
-            Verdict::Cool(until.max(now + 10 * SECOND))
         }
         408 | 500..=599 => Verdict::Next,
         _ => Verdict::Answer,
@@ -210,6 +213,7 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
         Bytes::from(serde_json::to_vec(&doc).unwrap_or_default())
     });
     let body = unprefixed.unwrap_or(body);
+    let log = Log { method: &method, path, inbound: &inbound, started };
     let mut last = None;
     for mut target in route.targets {
         let mut renewed = false;
@@ -237,7 +241,7 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
                 {
                     app.seat(&inbound, id, route.moved, now);
                 }
-                log(&method, path, &target, status, &inbound, &response_headers, started);
+                log.attempt(&target, status, &response_headers, b"");
                 let stream =
                     Tap::new(response.bytes_stream(), receipt, app.state_dir().to_path_buf(), &response_headers);
                 let mut out = Response::new(Body::from_stream(stream));
@@ -250,7 +254,7 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
                 receipt.read_body(&bytes, false);
                 receipt.write(app.state_dir());
             }
-            log(&method, path, &target, status, &inbound, &response_headers, started);
+            log.attempt(&target, status, &response_headers, &bytes);
             let mut answer = Response::new(Body::from(bytes.clone()));
             *answer.status_mut() = status;
             *answer.headers_mut() = client_headers(&response_headers);
@@ -273,6 +277,10 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
         }
     }
     last.unwrap_or_else(|| {
+        println!(
+            "{method} {} 503 model={} entrypoint={} no credential can take it",
+            log.path, inbound.model, inbound.entrypoint
+        );
         error(
             StatusCode::SERVICE_UNAVAILABLE,
             "overloaded_error",
@@ -281,36 +289,42 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
     })
 }
 
-/// One line per upstream attempt, with the account's limits as Anthropic just reported them.
-fn log(
-    method: &Method,
-    path: &str,
-    target: &Target,
-    status: StatusCode,
-    inbound: &Inbound,
-    headers: &HeaderMap,
+/// The journal line for each upstream attempt of one request.
+struct Log<'a> {
+    method: &'a Method,
+    path: &'a str,
+    inbound: &'a Inbound,
     started: i64,
-) {
-    let credential = match target {
-        Target::Key { name, .. } => name.as_str(),
-        Target::Plan { id, .. } => id.as_str(),
-    };
-    let utilization = |window: &str| {
-        headers
-            .get(format!("anthropic-ratelimit-unified-{window}-utilization"))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-    };
-    println!(
-        "{method} {} {} credential={credential} model={} entrypoint={} 5h={} 7d={} ms={}",
-        path.split('?').next().unwrap_or(path),
-        status.as_u16(),
-        inbound.model,
-        inbound.entrypoint,
-        utilization("5h"),
-        utilization("7d"),
-        files::now_ms() - started
-    );
+}
+
+impl Log<'_> {
+    /// One line per attempt, with the account's limits as Anthropic just reported them and,
+    /// for a failure, Anthropic's error message.
+    fn attempt(&self, target: &Target, status: StatusCode, headers: &HeaderMap, error: &[u8]) {
+        let credential = match target {
+            Target::Key { name, .. } => name.as_str(),
+            Target::Plan { id, .. } => id.as_str(),
+        };
+        let utilization = |window: &str| {
+            let name = format!("anthropic-ratelimit-unified-{window}-utilization");
+            headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("-")
+        };
+        let message = serde_json::from_slice::<Value>(error)
+            .ok()
+            .and_then(|e| Some(format!(" error={}", e.pointer("/error/message")?)))
+            .unwrap_or_default();
+        println!(
+            "{} {} {} credential={credential} model={} entrypoint={} 5h={} 7d={} ms={}{message}",
+            self.method,
+            self.path.split('?').next().unwrap_or(self.path),
+            status.as_u16(),
+            self.inbound.model,
+            self.inbound.entrypoint,
+            utilization("5h"),
+            utilization("7d"),
+            files::now_ms() - self.started
+        );
+    }
 }
 
 /// One line in receipts.ndjson: one upstream attempt and the usage Anthropic reported for it.
@@ -570,6 +584,11 @@ mod tests {
         assert_eq!(classify(&plan(), StatusCode::TOO_MANY_REQUESTS, &h, b"", NOW), Verdict::Cool(reset * 1000));
         let plain = headers(&[("retry-after", "3")]);
         assert_eq!(classify(&key(), StatusCode::TOO_MANY_REQUESTS, &plain, b"", NOW), Verdict::Cool(NOW + 10_000));
+        let quota_probe = br#"{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}"#;
+        assert_eq!(
+            classify(&plan(), StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new(), quota_probe, NOW),
+            Verdict::Answer
+        );
     }
 
     #[test]
