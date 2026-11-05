@@ -33,7 +33,7 @@ Every client on the pool is a real Claude Code binary (CLI, Agent SDK, or Claude
 - **OAuth account**: `Authorization` becomes the account's bearer token; the client's own `Authorization` and `X-Api-Key` never leave. Body bytes untouched.
 - **API key**: `x-api-key` set to the key, `Authorization` dropped, and the OAuth-only betas (`oauth-*`, `claude-code-*`) dropped. Body bytes untouched, except a `<prefix>/` model name loses its prefix.
 - **Responses** stream back byte for byte (decompressed), with upstream headers minus hop-by-hop ones and `set-cookie`, so `anthropic-ratelimit-unified-*` and `request-id` reach the client.
-- The proxy's own calls (sampler, token refresh, reset claims, sign-in) say `User-Agent: broadcom-proxy/<version>`. Anthropic's usage, profile and token endpoints answer it the same as Claude Code's own client (checked in the shadow run).
+- The proxy's own calls (sampler, token refresh, reset claims, sign-in) say `User-Agent: broadcom-proxy/<version>`. Anthropic's usage and profile endpoints answer it the same as Claude Code's own client (checked in the shadow run). The token endpoint was only probed with an invalid grant, which it refused the same way for both; a real refresh, reset claim or sign-in hasn't run against Anthropic yet, only against the stand-ins in `tests/owner.rs`.
 
 It doesn't disguise clients. CLIProxyAPI rewrites non-Claude-Code clients to look like Claude Code on a Mac: it renames tools, replaces the system prompt, rewrites `metadata.user_id`, forges the billing-header signature and spoofs the TLS handshake. Our clients are Claude Code, so none of that is needed, and it's ~3k lines this proxy doesn't carry.
 
@@ -85,8 +85,8 @@ JSON over HTTP under `/v8/management`, bearer management key. Shapes match BROAD
 - `GET  /deck/events`: SSE. `snapshot` of live state on connect, `patch` with changed keys (`a:<account>`, `pool`; null = removed), a heartbeat every 20 s. `s:` and `app:` keys belong to the usage service.
 - `GET  /deck/accounts`: last week of limit readings and last day of session moves (`label` null: session names live in the usage service).
 - `POST /deck/accounts/policy`: preview, or save when `revision` (the config file's hash) still matches.
-- `GET  /credentials`, `PATCH /credentials/status {id, disabled}`, `DELETE /credentials?id=`, `POST /credentials/refresh {id}`.
-- `POST /oauth/start {provider: "claude"|"codex"}` → `{state, url, flow, userCode?}`; `GET /oauth/status?state=`; `POST /oauth/finish {state, code}` for Claude. Both flows work from any device: Claude's hosted page shows a code to paste, ChatGPT's device page takes a code. A new login joins the pool and the stream the moment it's saved; signing in an existing account again replaces its tokens in its own file.
+- `GET  /credentials` → `{files: [{auth_index, name, provider, disabled, status, email?, requires_sign_in?, unavailable?, status_message?}]}`, OAuth logins only (`name` is the file name). `PATCH /credentials/status {name, disabled}`, `DELETE /credentials {names}`, `POST /credentials/refresh {name}`, each answering `{}`.
+- `GET /oauth/auth-url?provider=claude|codex[&name=<file>]` → `{state, url, flow, user_code?}`; `GET /oauth/status?state=` → `{status: "wait"|"ok"|"error", error?}`; `POST /oauth/callback {provider, code, state}` (or `{provider, redirect_url}`) for Claude; `DELETE /oauth/session?state=`. Both flows work from any device: Claude's hosted page shows a code to paste, ChatGPT's device page takes a code. A new login joins the pool and the stream the moment it's saved; signing in an existing account again (or the login `name` points at) replaces its tokens in its own file.
 - `POST /pool/resets/{account}/spend`.
 
 Anything that writes credentials, refreshes or spends is refused (409) unless the proxy is the account owner.
@@ -95,13 +95,13 @@ Anything that writes credentials, refreshes or spends is refused (409) unless th
 
 One camelCase JSON file (`config.example.json`): listen address, `accountOwner`, client and management key files, credentials and state directories, the account list path, API keys (name, key file, prefix, priority), pool policy, `agentSdkFactor`, reset command. Secrets live in their own files, never inline.
 
-`accountOwner` makes this the one process that refreshes tokens, writes credential files and spends resets. Refresh tokens rotate when used, so a second refresher logs accounts out; a shadow runs with it off and rereads credential files the owner keeps current.
+`accountOwner` makes this the one process that refreshes tokens, writes credential files and spends resets. Refresh tokens rotate when used, so a second refresher logs accounts out; a shadow runs with it off and rereads credential files the owner keeps current. Every write to a login (refresh, sign-in, turning it off) goes through one path under the state lock that lays only the changed fields onto the login as it stands, so a refresh can't undo a change made meanwhile or write back a removed login. A rescan takes a file only when it's newer than the copy held.
 
 The credentials directory is rescanned every minute and whenever a token is refused. A policy saved through the API takes effect at once; other config edits take a restart, which the socket makes seamless.
 
 ## Running
 
-- systemd socket activation (the socket unit holds the port across restarts), graceful drain on SIGTERM: in-flight streams finish, new connections queue on the socket. Without a passed socket it binds `listen`.
+- systemd socket activation (the socket unit holds the port across restarts), graceful drain on SIGTERM: live dashboard streams end, requests in flight get up to 10 minutes to finish, new connections queue on the socket. Without a passed socket it binds `listen`.
 - One binary, tokio + axum + reqwest on rustls. No TLS fingerprint games.
 - Logs: one line per upstream attempt to the journal (credential, model, entrypoint, the 5h/7d utilization Anthropic reported, Anthropic's error message on failure); no request dumps.
 
