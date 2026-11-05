@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     app::{App, Inbound, Target},
     files,
-    pool::{MINUTE, SECOND},
+    pool::{HOUR, MINUTE, SECOND, WEEK},
 };
 
 /// What the proxy does after an upstream error.
@@ -48,24 +48,39 @@ pub fn classify(target: &Target, status: StatusCode, headers: &HeaderMap, body: 
         400 if text.contains("credit balance is too low") => Verdict::Cool(now + MINUTE),
         400 if text.contains("identity verification") => Verdict::Cool(now + 30 * MINUTE),
         429 => {
-            let rejected = |window: &str| header(&format!("anthropic-ratelimit-unified-{window}status")) == "rejected";
             let after = now + seconds("retry-after").unwrap_or(10) * SECOND;
             match target {
-                // A plan's 429 without a rejected window is the request's own: Anthropic answers
-                // Claude Code's startup quota probe that way on every account.
-                Target::Plan { .. } if !["", "5h-", "7d-"].into_iter().any(rejected) => Verdict::Answer,
-                Target::Plan { .. } => {
-                    let reset =
-                        |window: &str| seconds(&format!("anthropic-ratelimit-unified-{window}reset")).unwrap_or(0);
-                    let until = ["5h-", "7d-"].into_iter().filter(|w| rejected(w)).map(reset).chain([reset("")]).max();
-                    Verdict::Cool(after.max(until.unwrap_or(0) * SECOND).max(now + 10 * SECOND))
-                }
                 Target::Key { .. } => Verdict::Cool(after.max(now + 10 * SECOND)),
+                Target::Plan { .. } => match spent_window_reset(headers) {
+                    Some(reset) => Verdict::Cool(after.max(reset).max(now + 10 * SECOND).min(now + LONGEST_WINDOW)),
+                    None => Verdict::Answer,
+                },
             }
         }
         408 | 500..=599 => Verdict::Next,
         _ => Verdict::Answer,
     }
+}
+
+/// Anthropic's longest limit window, a week, and an hour of slack: no cooldown runs longer.
+const LONGEST_WINDOW: i64 = WEEK + HOUR;
+
+/// When the account's own five-hour or weekly window that Anthropic says is used up resets
+/// (unix ms), or None when neither is. A 429 that leaves both standing is the request's own:
+/// Anthropic sends it for Claude Code's startup quota probe, for a request that isn't Claude
+/// Code's, and when only a model's own weekly window (Fable) or overage ran out.
+pub fn spent_window_reset(headers: &HeaderMap) -> Option<i64> {
+    let header = |name: String| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_lowercase();
+    let unified = header("anthropic-ratelimit-unified-status".into());
+    ["5h", "7d"]
+        .into_iter()
+        .filter(|w| {
+            let status = header(format!("anthropic-ratelimit-unified-{w}-status"));
+            let used = header(format!("anthropic-ratelimit-unified-{w}-utilization")).parse::<f64>().unwrap_or(0.0);
+            status == "rejected" || (status.is_empty() && unified == "rejected" && used >= 1.0)
+        })
+        .map(|w| header(format!("anthropic-ratelimit-unified-{w}-reset")).parse::<i64>().unwrap_or(0) * SECOND)
+        .max()
 }
 
 /// The parts of a request body routing reads.
@@ -366,7 +381,7 @@ pub struct Receipt {
     cache_write_1h_tokens: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
     entrypoint: String,
-    usage: Map<String, Value>,
+    usage: Value,
 }
 
 impl Receipt {
@@ -405,7 +420,7 @@ impl Receipt {
             service_tier: None,
             cache_write_1h_tokens: 0,
             entrypoint: inbound.entrypoint.clone(),
-            usage: Map::new(),
+            usage: Value::Object(Map::new()),
         }
     }
 
@@ -419,34 +434,26 @@ impl Receipt {
         if let Some(model) = message.get("model").and_then(Value::as_str) {
             self.model = model.into();
         }
-        if let Some(Value::Object(usage)) = message.get("usage").or_else(|| doc.get("usage")) {
-            self.usage.extend(usage.clone());
+        if let (Some(Value::Object(usage)), Value::Object(held)) =
+            (message.get("usage").or_else(|| doc.get("usage")), &mut self.usage)
+        {
+            held.extend(usage.clone());
         }
     }
 
     fn write(&mut self, dir: &std::path::Path) {
-        let n = |key: &str| self.usage.get(key).and_then(Value::as_i64).unwrap_or(0);
-        self.input_tokens = n("input_tokens");
-        self.output_tokens = n("output_tokens");
-        self.cache_read_tokens = n("cache_read_input_tokens");
-        self.cache_write_tokens = n("cache_creation_input_tokens");
-        let nested = |path: &str| self.usage.pointer_get(path);
-        self.reasoning_tokens = nested("/output_tokens_details/thinking_tokens").unwrap_or(0);
-        self.cache_write_1h_tokens = nested("/cache_creation/ephemeral_1h_input_tokens").unwrap_or(0);
-        self.service_tier =
-            ["speed", "service_tier"].iter().find_map(|k| self.usage.get(*k).and_then(Value::as_str)).map(String::from);
+        let n = |path: &str| self.usage.pointer(path).and_then(Value::as_i64).unwrap_or(0);
+        self.input_tokens = n("/input_tokens");
+        self.output_tokens = n("/output_tokens");
+        self.cache_read_tokens = n("/cache_read_input_tokens");
+        self.cache_write_tokens = n("/cache_creation_input_tokens");
+        self.reasoning_tokens = n("/output_tokens_details/thinking_tokens");
+        self.cache_write_1h_tokens = n("/cache_creation/ephemeral_1h_input_tokens");
+        self.service_tier = ["/speed", "/service_tier"]
+            .iter()
+            .find_map(|k| self.usage.pointer(k).and_then(Value::as_str))
+            .map(String::from);
         files::append(dir, "receipts.ndjson", self);
-    }
-}
-
-trait PointerGet {
-    fn pointer_get(&self, path: &str) -> Option<i64>;
-}
-
-impl PointerGet for Map<String, Value> {
-    fn pointer_get(&self, path: &str) -> Option<i64> {
-        let (first, rest) = path.trim_start_matches('/').split_once('/')?;
-        self.get(first)?.pointer(&format!("/{rest}"))?.as_i64()
     }
 }
 
@@ -457,15 +464,14 @@ struct Tap<S> {
     receipt: Option<Receipt>,
     dir: std::path::PathBuf,
     sse: bool,
-    line: Vec<u8>,
-    /// The current SSE line isn't one the receipt needs.
-    skipping: bool,
-    body: Vec<u8>,
+    /// The JSON answer so far, or the SSE line so far.
+    buffer: Vec<u8>,
+    /// The SSE stream reached `message_stop`.
     stopped: bool,
+    /// Upstream finished sending.
+    done: bool,
 }
 
-/// SSE lines carrying a message's id and usage start with this, after `data: `.
-const MESSAGE_EVENT: &[u8] = br#"{"type":"message_"#;
 const MAX_JSON_BODY: usize = 32 << 20;
 
 impl<S> Tap<S> {
@@ -474,37 +480,29 @@ impl<S> Tap<S> {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|t| t.starts_with("text/event-stream"));
-        Self { inner, receipt, dir, sse, line: Vec::new(), skipping: false, body: Vec::new(), stopped: !sse }
+        Self { inner, receipt, dir, sse, buffer: Vec::new(), stopped: false, done: false }
     }
 
     fn feed(&mut self, chunk: &[u8]) {
         let Some(receipt) = self.receipt.as_mut() else { return };
         if !self.sse {
-            if self.body.len() + chunk.len() <= MAX_JSON_BODY {
-                self.body.extend_from_slice(chunk);
+            if self.buffer.len() + chunk.len() <= MAX_JSON_BODY {
+                self.buffer.extend_from_slice(chunk);
             }
             return;
         }
         for &byte in chunk {
-            if byte == b'\n' {
-                if !self.skipping
-                    && let Some(data) = self.line.strip_prefix(b"data: ")
-                {
-                    if data.starts_with(br#"{"type":"message_stop""#) {
-                        self.stopped = true;
-                    }
-                    receipt.read_body(data, true);
-                }
-                self.line.clear();
-                self.skipping = false;
-            } else if !self.skipping {
-                self.line.push(byte);
-                let probe = 6 + MESSAGE_EVENT.len();
-                if self.line.len() == probe && !self.line.ends_with(MESSAGE_EVENT) {
-                    self.skipping = true;
-                    self.line.clear();
-                }
+            if byte != b'\n' {
+                self.buffer.push(byte);
+                continue;
             }
+            if let Some(data) = self.buffer.strip_prefix(b"data: ")
+                && data.starts_with(br#"{"type":"message_"#)
+            {
+                self.stopped |= data.starts_with(br#"{"type":"message_stop""#);
+                receipt.read_body(data, true);
+            }
+            self.buffer.clear();
         }
     }
 }
@@ -513,11 +511,9 @@ impl<S> Drop for Tap<S> {
     fn drop(&mut self) {
         let Some(mut receipt) = self.receipt.take() else { return };
         if !self.sse {
-            receipt.read_body(&self.body, false);
+            receipt.read_body(&self.buffer, false);
         }
-        if !self.stopped {
-            receipt.failed = true;
-        }
+        receipt.failed = !self.done || (self.sse && !self.stopped);
         receipt.write(&self.dir);
     }
 }
@@ -527,9 +523,13 @@ impl<S: Stream<Item = reqwest::Result<Bytes>> + Unpin> Stream for Tap<S> {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next = Pin::new(&mut self.inner).poll_next(cx);
-        if let Poll::Ready(Some(Ok(chunk))) = &next {
-            let chunk = chunk.clone();
-            self.feed(&chunk);
+        match &next {
+            Poll::Ready(Some(Ok(chunk))) => {
+                let chunk = chunk.clone();
+                self.feed(&chunk);
+            }
+            Poll::Ready(None) => self.done = true,
+            _ => {}
         }
         next
     }
@@ -588,6 +588,31 @@ mod tests {
             ("anthropic-ratelimit-unified-5h-reset", &reset.to_string()),
         ]);
         assert_eq!(classify(&plan(), StatusCode::TOO_MANY_REQUESTS, &h, b"", NOW), Verdict::Cool(reset * 1000));
+        let week = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-utilization", "1.0"),
+            ("anthropic-ratelimit-unified-7d-reset", &(NOW / 1000 + 30 * 86_400).to_string()),
+        ]);
+        let capped = Verdict::Cool(NOW + WEEK + HOUR);
+        assert_eq!(
+            classify(&plan(), StatusCode::TOO_MANY_REQUESTS, &week, b"", NOW),
+            capped,
+            "no cooldown past a week"
+        );
+        let fable_only = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", &reset.to_string()),
+        ]);
+        assert_eq!(classify(&plan(), StatusCode::TOO_MANY_REQUESTS, &fable_only, b"", NOW), Verdict::Answer);
+        let overage = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-representative-claim", "overage"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.4"),
+        ]);
+        assert_eq!(classify(&plan(), StatusCode::TOO_MANY_REQUESTS, &overage, b"", NOW), Verdict::Answer);
         let plain = headers(&[("retry-after", "3")]);
         assert_eq!(classify(&key(), StatusCode::TOO_MANY_REQUESTS, &plain, b"", NOW), Verdict::Cool(NOW + 10_000));
         let quota_probe = br#"{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}"#;
@@ -657,6 +682,7 @@ mod tests {
             for chunk in stream.as_bytes().chunks(split) {
                 tap.feed(chunk);
             }
+            tap.done = true;
             drop(tap);
         }
         let text = std::fs::read_to_string(dir.path().join("receipts.ndjson")).unwrap();
@@ -670,5 +696,18 @@ mod tests {
             assert_eq!(r["failed"], false);
         }
         assert_eq!(text.lines().count(), 4);
+    }
+
+    #[test]
+    fn a_json_answer_cut_off_midway_is_a_failed_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = Receipt::new(&Inbound::default(), &plan(), StatusCode::OK, &HeaderMap::new(), NOW);
+        let json = headers(&[("content-type", "application/json")]);
+        let mut tap = Tap::new((), Some(receipt), dir.path().to_path_buf(), &json);
+        tap.feed(br#"{"id":"msg_1","usage":{"input_tok"#);
+        drop(tap);
+        let text = std::fs::read_to_string(dir.path().join("receipts.ndjson")).unwrap();
+        let r: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(r["failed"], true);
     }
 }
