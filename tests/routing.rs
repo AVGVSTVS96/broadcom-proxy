@@ -189,7 +189,7 @@ async fn plans_go_first_and_a_key_waits_for_its_accounts_extra_usage() {
     p.plans_out();
     let (status, _) = p.send("claude-x", None).await;
     assert_eq!(status, 429, "with extra usage off everywhere, no key is spent");
-    assert!(p.up.served().is_empty());
+    assert_eq!(p.up.served(), Vec::<String>::new());
 
     p.extra_usage("b");
     assert_eq!(p.send("claude-x", None).await.0, 200);
@@ -331,7 +331,7 @@ async fn a_refused_token_is_reread_from_its_file_when_another_process_owns_the_a
     assert_eq!(p.send("claude-x", None).await.0, 200);
     let served = p.up.served();
     assert!(served.contains(&"token-a2".to_string()), "{served:?}");
-    assert!(!p.file("receipts.ndjson").is_empty());
+    assert_ne!(p.file("receipts.ndjson"), "");
 }
 
 #[tokio::test]
@@ -357,7 +357,7 @@ async fn a_client_without_a_proxy_key_is_turned_away() {
     let p = pool(&[]).await;
     let response = p.http.post(format!("{}/v1/messages", p.proxy)).json(&json!({"model": "m"})).send().await.unwrap();
     assert_eq!(response.status(), 401);
-    assert!(p.up.served().is_empty());
+    assert_eq!(p.up.served(), Vec::<String>::new());
     let hello = p.http.head(format!("{}/api/hello", p.proxy)).send().await.unwrap();
     assert_eq!(hello.status(), 200);
 }
@@ -504,5 +504,5 @@ async fn with_every_credential_sitting_out_the_client_hears_when_the_pool_frees_
     assert_eq!(answer.status(), 429);
     let wait: i64 = answer.headers()["retry-after"].to_str().unwrap().parse().unwrap();
     assert!((1..=60).contains(&wait), "{wait}");
-    assert!(p.up.served().is_empty());
+    assert_eq!(p.up.served(), Vec::<String>::new());
 }
