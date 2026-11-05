@@ -105,6 +105,8 @@ pub struct Route {
     pub unprefixed: Option<String>,
     /// Why the session's account isn't first, if it had one.
     pub moved: Option<Cause>,
+    /// When the first credential that's sitting out comes back.
+    pub free_at: Option<i64>,
 }
 
 const SEAT_DAY: i64 = 24 * HOUR;
@@ -209,6 +211,14 @@ impl App {
         let mut route = Route::default();
         let (prefix, bare) = inbound.model.split_once('/').unwrap_or(("", &inbound.model));
         let prefixed = !prefix.is_empty() && state.keys.iter().any(|k| k.prefix == prefix);
+        let keys_cooling =
+            state.keys.iter().filter(|k| k.cool_until > now && (!prefixed || k.prefix == prefix)).map(|k| k.cool_until);
+        let plans_cooling = state
+            .accounts
+            .iter()
+            .filter(|a| !prefixed && !a.login.disabled() && a.cool_until > now)
+            .map(|a| a.cool_until);
+        route.free_at = keys_cooling.chain(plans_cooling).min();
         let mut keys: Vec<&ApiKey> =
             state.keys.iter().filter(|k| k.cool_until <= now && (!prefixed || k.prefix == prefix)).collect();
         keys.sort_by_key(|k| std::cmp::Reverse(k.priority));

@@ -215,6 +215,7 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
     let body = unprefixed.unwrap_or(body);
     let log = Log { method: &method, path, inbound: &inbound, started };
     let mut last = None;
+    let route_free_at = route.free_at;
     for mut target in route.targets {
         let mut renewed = false;
         loop {
@@ -278,14 +279,19 @@ async fn forward(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body
     }
     last.unwrap_or_else(|| {
         println!(
-            "{method} {} 503 model={} entrypoint={} no credential can take it",
+            "{method} {} 429 model={} entrypoint={} every credential is sitting out",
             log.path, inbound.model, inbound.entrypoint
         );
-        error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded_error",
-            "No account in the pool can take this request right now.",
-        )
+        let message = match route_free_at {
+            Some(at) => format!("Every account in the pool is at a limit or out of credit until {}.", files::when(at)),
+            None => "The pool has no account that can take this request.".into(),
+        };
+        let mut answer = error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &message);
+        if let Some(at) = route_free_at {
+            let seconds = ((at - files::now_ms()) / SECOND).max(1);
+            answer.headers_mut().insert("retry-after", HeaderValue::from(seconds));
+        }
+        answer
     })
 }
 

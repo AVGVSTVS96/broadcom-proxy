@@ -456,3 +456,22 @@ async fn a_policy_saves_only_at_the_revision_it_was_read_at() {
         .unwrap();
     assert_eq!(bad.status(), 400);
 }
+
+#[tokio::test]
+async fn with_every_credential_sitting_out_the_client_hears_when_the_pool_frees_up() {
+    let p = pool(&[("key-hi", 300)]).await;
+    p.up.answer("key-hi", 400, CREDIT_LOW);
+    let send = || {
+        p.http
+            .post(format!("{}/v1/messages", p.proxy))
+            .header("x-api-key", "client-key")
+            .json(&json!({"model": "included/claude-x"}))
+            .send()
+    };
+    assert_eq!(send().await.unwrap().status(), 400);
+    let answer = send().await.unwrap();
+    assert_eq!(answer.status(), 429);
+    let wait: i64 = answer.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+    assert_eq!(p.up.served(), ["key-hi"]);
+}
