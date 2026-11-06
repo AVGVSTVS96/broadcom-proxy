@@ -51,14 +51,18 @@ impl Default for Config {
     }
 }
 
-/// An API key, the pool's last resort: tried only after every plan account, and only while
-/// `account` has extra usage turned on.
+/// An API key, tried once the plans are out. A `free` key draws on credit that costs nothing,
+/// like the monthly API credit a Max or Ultra plan includes, so it comes right after the plans.
+/// Any other key bills money, so it comes last, only while `account` has extra usage turned on.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApiKeyConfig {
     pub name: String,
     pub key_file: PathBuf,
-    /// The email of the plan login whose extra-usage setting decides whether this key may spend.
+    #[serde(default)]
+    pub free: bool,
+    /// The email of the plan login whose extra-usage setting decides whether a paid key may spend.
+    #[serde(default)]
     pub account: String,
 }
 
@@ -81,6 +85,12 @@ impl Config {
         }
         for key in &mut config.api_keys {
             key.key_file = expand_home(&key.key_file);
+            if !key.free && key.account.trim().is_empty() {
+                anyhow::bail!(
+                    "API key {:?}: a paid key needs the `account` whose extra usage gates it, or `free: true`",
+                    key.name
+                );
+            }
         }
         Ok((config, revision(text.as_bytes())))
     }

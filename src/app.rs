@@ -217,8 +217,10 @@ impl App {
         weight(entrypoint, self.config.agent_sdk_factor)
     }
 
-    /// Plans first, in rank order, the session's own account first unless it should move.
-    /// API keys come last, and only those whose account has extra usage on.
+    /// Spends in the order that costs least: plans with room, in rank order, the session's own
+    /// account first unless it should move; then free-credit keys; then paid extra usage last:
+    /// plans past their limits, which Anthropic serves only as extra usage where it's on, and
+    /// paid keys whose account has extra usage on.
     pub fn route(&self, inbound: &Inbound, now: i64) -> Route {
         let state = self.state();
         let mut route = Route::default();
@@ -242,26 +244,25 @@ impl App {
                 None => route.moved = Some(Cause::Limit),
             }
         }
-        route.targets.extend(order.into_iter().map(|i| {
+        let open = |i: &usize| rows.iter().any(|r| r.index == *i && r.open);
+        let (plans, spent): (Vec<usize>, Vec<usize>) = order.into_iter().partition(open);
+        let plan = |i: usize| {
             let a = available[i];
             Target::Plan { id: a.id(), token: a.login.get("access_token").to_string() }
-        }));
-
-        let keys: Vec<&ApiKey> = state
-            .keys
-            .iter()
-            .filter(|k| {
-                state
-                    .accounts
-                    .iter()
-                    .any(|a| a.extra_usage && !a.login.disabled() && a.label().eq_ignore_ascii_case(k.account.trim()))
-            })
-            .collect();
-        route.targets.extend(keys.iter().filter(|k| k.cool_until <= now).map(|k| Target::Key {
-            id: k.id.clone(),
-            name: k.name.clone(),
-            key: k.key.clone(),
-        }));
+        };
+        let paid_on = |k: &ApiKey| {
+            state
+                .accounts
+                .iter()
+                .any(|a| a.extra_usage && !a.login.disabled() && a.label().eq_ignore_ascii_case(k.account.trim()))
+        };
+        let keys: Vec<&ApiKey> = state.keys.iter().filter(|k| k.free || paid_on(k)).collect();
+        let key = |k: &&ApiKey| Target::Key { id: k.id.clone(), name: k.name.clone(), key: k.key.clone() };
+        let ready = |k: &&&ApiKey| k.cool_until <= now;
+        route.targets.extend(plans.into_iter().map(plan));
+        route.targets.extend(keys.iter().filter(|k| k.free).filter(ready).map(key));
+        route.targets.extend(spent.into_iter().map(plan));
+        route.targets.extend(keys.iter().filter(|k| !k.free).filter(ready).map(key));
         let plans_cooling =
             state.accounts.iter().filter(|a| !a.login.disabled() && a.cool_until > now).map(|a| a.cool_until);
         let keys_cooling = keys.iter().filter(|k| k.cool_until > now).map(|k| k.cool_until);

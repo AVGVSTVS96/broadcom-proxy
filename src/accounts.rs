@@ -91,7 +91,7 @@ pub struct Account {
     /// The last reading written to the history, so it records only real moves.
     pub logged: Reading,
     pub cloud: Option<Cloud>,
-    /// Whether the account may pay past its plan, as its usage endpoint last said.
+    /// Whether the account may pay past its plan (paid extra usage), as its usage endpoint last said.
     pub extra_usage: bool,
     pub resets: Vec<Reset>,
     pub at_limit: Option<AtLimit>,
@@ -213,13 +213,15 @@ pub struct Spent {
     pub until: i64,
 }
 
-/// An API key, spent only while its account has extra usage on.
+/// An API key: free credit right after the plans, or paid, last and only while its account
+/// has extra usage on.
 #[derive(Debug)]
 pub struct ApiKey {
     pub name: String,
     /// The id CLIProxyAPI gives the same key, so records join across both proxies.
     pub id: String,
     pub key: String,
+    pub free: bool,
     pub account: String,
     pub cool_until: i64,
 }
@@ -231,6 +233,7 @@ impl ApiKey {
             name: config.name.clone(),
             id: api_key_id(&key),
             key,
+            free: config.free,
             account: config.account.clone(),
             cool_until: 0,
         })

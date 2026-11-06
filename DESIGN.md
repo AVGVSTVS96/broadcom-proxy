@@ -17,7 +17,7 @@ agents ──/v1──▶ broadcom-proxy ──▶ api.anthropic.com
 ## What it does, and nothing else
 
 1. **Forward** `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models`. Answer `HEAD|GET /api/hello` and `/healthz` with 200.
-2. **Pick an account** per request: plans ranked by room, the session's own account first until it should move. An API key only once every plan is out, and only while its account has extra usage on.
+2. **Pick an account** per request, cheapest first: plans ranked by room, the session's own account first until it should move; then free-credit API keys; then paid extra usage last, only where it's turned on.
 3. **Keep accounts signed in**: refresh OAuth tokens before they expire, sign new ones in (Claude code-paste, ChatGPT device code).
 4. **Measure limits**: read them from every response's headers, and sample each account's usage, extra-usage setting, plan and held resets.
 5. **Spend held resets** when every account has used its week.
@@ -45,7 +45,12 @@ Same decisions as the Go fork's pool, carried over deliberately (`src/pool.rs`, 
 
 - **Rank plans** (`pool::rank`): usable (5-hour < session cutoff, week < weekly cutoff, signed in) first; among usable, holders of a reset first, then comfortable room per agent, then known, then urgency to use the week before it resets, then room. Unusable: open ones by five-hour use, then soonest free. Agent SDK and `claude -p` sessions weigh `agentSdkFactor` (1.7) on the five-hour room.
 - **Session affinity**: key is `X-Claude-Code-Session-Id`, else `metadata.user_id.session_id` (UUIDs only). The seat is the binding: a session stays on its account while seen in the last 24 h, until `pool::move_away` says it's over a cutoff (any usable account takes it) or near one with a calm account free. A seated account that's cooling or turned off sends the session to the next ranked one.
-- **Plans first, API keys last**: a plan's usage is worth far more than the same dollars of API credit, so a key is the pool's last resort. It's tried only after every plan account (usable or not) has failed or is sitting out, and only while the plan account it names (`account`) has extra usage turned on, as that account's usage endpoint reports it. That's the switch that lets an account pay past its plan, so it's the owner's yes to spending; when it's off or unknown, the key isn't used. Keys go in config order; one that answers "credit balance is too low" cools for a minute and the next is tried.
+- **Spend order: plans, then free credit, then paid extra usage** (`App::route`). Free credit and paid extra usage are different things: free credit costs nothing (the monthly API credit a Max or Ultra plan includes, or a promotion), while extra usage bills money. So:
+  1. Plans under 100% of both windows, in rank order.
+  2. Free-credit keys (`free: true`), with no switch to check.
+  3. Paid extra usage: plans past a limit (Anthropic serves those only as extra usage, where the account has it on, else answers 429), then paid keys, each only while the plan account it names (`account`) has extra usage turned on, as that account's usage endpoint reports it. That switch is the owner's yes to paying; when it's off or unknown, a paid key isn't used.
+
+  Keys go in config order within their tier; one that answers "credit balance is too low" cools for a minute and the next is tried.
 - **Failover, before the first byte only**, one pass over the credentials in order (no retry rounds: Claude Code retries on its own):
 
 | upstream | what happens |
@@ -93,7 +98,7 @@ Anything that writes credentials, refreshes or spends is refused (409) unless th
 
 ## Config
 
-One optional camelCase JSON file (`config.example.json`), every field defaulted (README has the table): listen address, `accountOwner`, client and management key files, credentials and state directories, the account list path, API keys (name, key file, the account whose extra usage gates it), pool policy, `agentSdkFactor`, reset command. Secrets live in their own files, never inline.
+One optional camelCase JSON file (`config.example.json`), every field defaulted (README has the table): listen address, `accountOwner`, client and management key files, credentials and state directories, the account list path, API keys (name, key file, `free` or the account whose extra usage gates a paid key), pool policy, `agentSdkFactor`, reset command. Secrets live in their own files, never inline.
 
 `accountOwner` makes this the one process that refreshes tokens, writes credential files and spends resets. Refresh tokens rotate when used, so a second refresher logs accounts out; a shadow runs with it off and rereads credential files the owner keeps current. Every write to a login (refresh, sign-in, turning it off) goes through one path under the state lock that lays only the changed fields onto the login as it stands, so a refresh can't undo a change made meanwhile or write back a removed login. A rescan takes a file only when it's newer than the copy held.
 

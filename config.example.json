@@ -7,7 +7,8 @@
   "stateDir": "~/.local/state/broadcom-proxy",
   "accountsFile": "~/.local/state/broadcom-proxy/accounts.json",
   "apiKeys": [
-    { "name": "spare-credit", "keyFile": "~/.config/broadcom-proxy/api-key", "account": "you@example.com" }
+    { "name": "included-credit", "keyFile": "~/.config/broadcom-proxy/included-api-key", "free": true },
+    { "name": "paid-credit", "keyFile": "~/.config/broadcom-proxy/paid-api-key", "account": "you@example.com" }
   ],
   "policy": { "sessionCutoff": 90, "weeklyCutoff": 98, "agentsPerAccount": 100 },
   "agentSdkFactor": 1.7,

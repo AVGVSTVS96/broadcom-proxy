@@ -7,7 +7,7 @@ It's a small Rust port of the Claude account pool in [AVGVSTVS96/CLIProxyAPI](ht
 ```
 claude ─┐                        ┌─▶ Max account A
 claude ─┼─▶ broadcom-proxy ──────┼─▶ Max account B
-claude ─┘   127.0.0.1:8317       └─▶ Pro account C   (API key: last resort)
+claude ─┘   127.0.0.1:8317       └─▶ Pro account C   (then API keys)
 ```
 
 ## Start
@@ -31,7 +31,9 @@ claude
 1. **Plans first.** Accounts under their cutoffs (90% of the five-hour limit, 98% of the week) come first: one holding a reset, then one with comfortable room per running agent, then the one whose week would otherwise reset unused, then the most room. Agent SDK and `claude -p` sessions count 1.7× against the five-hour limit, since they drain it faster.
 2. **Sessions stay put.** A Claude Code session keeps its account, so its prompt cache stays warm, until that account passes a cutoff, or nears one while a calm account is free.
 3. **Failover before the first byte.** When an account hits its limit or is signed out, the request goes to the next one in the same call, and that account sits out until it can serve again. An overloaded one just passes the request on.
-4. **API keys last.** A plan's usage is worth far more than the same money in API credit, so a key is tried only after every plan has failed or is sitting out, and only while the plan account it names has extra usage turned on in Claude's settings. That switch is the owner's yes to paying past the plan; while it's off, the key is never spent.
+4. **Then free credit, then paid extra usage.** Once no plan has room, the pool spends what costs nothing before what costs money:
+   - **Free credit**: API keys marked `free`, drawing on credit you don't pay for, like the monthly API credit a Max or Ultra plan includes, claimed into an API organization with no card on file. Anthropic counts that credit for the API, the Agent SDK and `claude -p`, not interactive Claude Code, and a key with no balance answers "credit balance is too low", so the pool moves on.
+   - **Paid extra usage**, last: a plan past its limits, which Anthropic serves only as extra usage on an account that has it turned on in Claude's settings, then paid API keys, each only while the plan account it names has extra usage on. That switch is the owner's yes to paying; while it's off, nothing paid is spent.
 5. **Held resets.** When every account has used its week, the pool spends a held weekly reset, if one has any.
 
 ## Config
@@ -46,7 +48,7 @@ Optional. Without a file at `~/.config/broadcom-proxy/config.json` (or the path 
 | `managementKeyFile` | `~/.config/broadcom-proxy/management-key` | Bearer key for the management API; written on first run |
 | `credentialsDir` | `~/.config/broadcom-proxy/auths` | One JSON file per login, in CLIProxyAPI's format |
 | `stateDir` | `~/.local/state/broadcom-proxy` | Receipts, limit history, session moves |
-| `apiKeys` | none | `[{"name", "keyFile", "account"}]`; `account` is the email of the plan login whose extra-usage switch gates the key |
+| `apiKeys` | none | `[{"name", "keyFile", "free", "account"}]`; `free: true` for a key on free credit, spent right after the plans; any other key is paid, spent last and only while `account`, the email of a plan login, has extra usage on |
 | `policy` | `{"sessionCutoff": 90, "weeklyCutoff": 98, "agentsPerAccount": 100}` | Cutoffs, also settable over the API |
 | `agentSdkFactor` | `1.7` | How much faster Agent SDK sessions drain the five-hour limit |
 | `resetCommand` | none | Run as `sh -c '<command> "$1"'` with a line about each reset spent or refused |

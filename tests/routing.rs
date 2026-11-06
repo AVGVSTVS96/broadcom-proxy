@@ -102,7 +102,8 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-/// Plan accounts `a` and `b` (tokens `token-a`, `token-b`) and API keys, each with its account's email.
+/// Plan accounts `a` and `b` (tokens `token-a`, `token-b`) and API keys, each with the email of
+/// the account whose extra usage gates it, or `free` for a key on free credit.
 async fn pool(keys: &[(&str, &str)]) -> Pool {
     let dir = tempfile::tempdir().unwrap();
     let at = |p: &str| dir.path().join(p);
@@ -115,7 +116,10 @@ async fn pool(keys: &[(&str, &str)]) -> Pool {
         .iter()
         .map(|(key, account)| {
             write(&at(key), key);
-            json!({"name": key, "keyFile": at(key), "account": account})
+            match *account {
+                "free" => json!({"name": key, "keyFile": at(key), "free": true}),
+                _ => json!({"name": key, "keyFile": at(key), "account": account}),
+            }
         })
         .collect();
     let config = json!({
@@ -168,6 +172,13 @@ impl Pool {
         self.app.state().account_mut(id).unwrap().extra_usage = true;
     }
 
+    /// Plan account `id` has used its week, so Anthropic serves it only as extra usage.
+    fn spent(&self, id: &str) {
+        let week = broadcom_proxy::pool::Window { used: 100.0, resets_at: i64::MAX / 2 };
+        self.app.state().account_mut(id).unwrap().reading =
+            broadcom_proxy::pool::Reading { five_hour: None, week: Some(week), at: 1 };
+    }
+
     /// Every plan account sits out, as if each had hit its limit.
     fn plans_out(&self) {
         for a in &mut self.app.state().accounts {
@@ -181,14 +192,40 @@ impl Pool {
 }
 
 #[tokio::test]
-async fn plans_go_first_and_a_key_waits_for_its_accounts_extra_usage() {
+async fn plans_then_free_credit_then_paid_extra_usage() {
+    let p = pool(&[("paid", "a@example.com"), ("free", "free")]).await;
+    p.extra_usage("a");
+    p.spent("a");
+    p.up.answer("token-b", 529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#);
+    p.up.answer("free", 400, CREDIT_LOW);
+    assert_eq!(p.send("claude-x", None).await.0, 200);
+    assert_eq!(
+        p.up.served(),
+        ["token-b", "free", "token-a"],
+        "the plan with room, then free credit, then the spent plan's paid extra usage"
+    );
+    p.up.answer("token-a", 529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#);
+    p.send("claude-x", None).await;
+    assert_eq!(p.up.served(), ["token-b", "token-a", "paid"], "a paid key comes last");
+}
+
+#[tokio::test]
+async fn a_free_key_needs_no_extra_usage() {
+    let p = pool(&[("free", "free")]).await;
+    p.plans_out();
+    assert_eq!(p.send("claude-x", None).await.0, 200);
+    assert_eq!(p.up.served(), ["free"]);
+}
+
+#[tokio::test]
+async fn plans_go_first_and_a_paid_key_waits_for_its_accounts_extra_usage() {
     let p = pool(&[("key-a", "a@example.com"), ("key-b", "B@example.com")]).await;
     assert_eq!(p.send("claude-x", None).await.0, 200);
     assert!(p.up.served()[0].starts_with("token-"), "a plan serves while one has room");
 
     p.plans_out();
     let (status, _) = p.send("claude-x", None).await;
-    assert_eq!(status, 429, "with extra usage off everywhere, no key is spent");
+    assert_eq!(status, 429, "with extra usage off everywhere, no paid key is spent");
     assert_eq!(p.up.served(), Vec::<String>::new());
 
     p.extra_usage("b");
